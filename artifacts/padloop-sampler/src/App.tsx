@@ -49,7 +49,10 @@ function loadYouTubeApi() {
     const script = document.createElement('script');
     script.src = 'https://www.youtube.com/iframe_api';
     script.async = true;
-    script.onerror = () => reject(new Error('YouTube preview could not load. Check your connection or use a local video file.'));
+    script.onerror = () => {
+      youtubeApiPromise = null;
+      reject(new Error('YouTube preview could not load. Check your connection or use a local video file.'));
+    };
     document.head.appendChild(script);
   });
   return youtubeApiPromise;
@@ -1154,6 +1157,15 @@ function App() {
     const id = parseYouTubeId(youtubeUrl);
     if (!id) {
       setYoutubeMessage('Paste a valid YouTube watch, short, or embed link.');
+      setYoutubeId('');
+      setYoutubeLoop(false);
+      return;
+    }
+    if (id === youtubeId && youtubePlayerRef.current) {
+      youtubePlayerRef.current.seekTo(0, true);
+      youtubePlayerRef.current.pauseVideo();
+      setYoutubeLoop(false);
+      setYoutubeMessage('Preview ready · set start and end cues below');
       return;
     }
     setYoutubeMessage('Loading YouTube preview…');
@@ -1924,7 +1936,7 @@ function App() {
         </div>
       </section>
       <footer className="footer"><span>PADLOOP SAMPLER · 16 SLOTS · NO INSTALL</span><span>KEYBOARD: Q W E R / A S D F / Z X C V / 1 2 3 4</span></footer>
-      <input ref={localVideoInputRef} type="file" accept="video/*,.mp4,.webm,.mov,.m4v,.ogv,.mkv" hidden onChange={event => { const file = event.currentTarget.files?.[0]; if (file) chooseLocalVideo(file); }} data-testid="input-local-video-file" />
+      <input ref={localVideoInputRef} type="file" accept="video/*,.mp4,.webm,.mov,.m4v,.ogv,.mkv" hidden onChange={event => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; if (file) chooseLocalVideo(file); }} data-testid="input-local-video-file" />
       <input ref={inputRef} type="file" accept="audio/*,.wav,.wave,.mp3,.m4a,.aac,.ogg,.oga,.flac,.aif,.aiff,.webm" hidden onChange={event => { const file = event.currentTarget.files?.[0]; if (file) void importFile(file, selectedRef.current); }} data-testid="input-sample-file" />
       {notice && <div className="notice" role="status" data-testid="status-notice">{notice}</div>}
     </main>
