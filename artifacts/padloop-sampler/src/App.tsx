@@ -10,12 +10,144 @@ type Pad = {
   volume: number;
 };
 
+type PresetVoice = {
+  name: string;
+  kind: 'kick' | 'snare' | 'closed-hat' | 'open-hat' | 'clap' | 'rim' | 'tom' | 'perc' | '808' | 'bounce';
+  frequency?: number;
+  duration: number;
+};
+
 const PAD_KEYS = ['Q', 'W', 'E', 'R', 'A', 'S', 'D', 'F', 'Z', 'X', 'C', 'V', '1', '2', '3', '4'];
 const padColors = ['#f1b95e', '#e88e70', '#75c9a4', '#a4a1dc', '#e9829c', '#79b9dc', '#d3a66d', '#78c8ad', '#db8d66', '#90b5da', '#b4a2d9', '#d5bd6b', '#75c6b1', '#df8e87', '#86b7dc', '#b1a0d5'];
 const emptyPad = (): Pad => ({ name: '', duration: 0, buffer: null, bars: [], loop: false, volume: 0.85 });
 const makePads = () => Array.from({ length: 16 }, emptyPad);
 const DB_NAME = 'padloop-local-kit';
 const DB_STORE = 'samples';
+
+const BOUNCY_808_VOICES: PresetVoice[] = [
+  { name: 'Punch Kick.wav', kind: 'kick', duration: 0.72 },
+  { name: 'Dry Snare.wav', kind: 'snare', duration: 0.48 },
+  { name: 'Closed Hat.wav', kind: 'closed-hat', duration: 0.2 },
+  { name: 'Open Hat.wav', kind: 'open-hat', duration: 0.62 },
+  { name: 'Clap.wav', kind: 'clap', duration: 0.48 },
+  { name: 'Rim Click.wav', kind: 'rim', duration: 0.24 },
+  { name: 'Low Tom.wav', kind: 'tom', frequency: 118, duration: 0.48 },
+  { name: 'Perc Tick.wav', kind: 'perc', frequency: 940, duration: 0.2 },
+  { name: '808 Sub C.wav', kind: '808', frequency: 65.41, duration: 1.35 },
+  { name: '808 Sub A.wav', kind: '808', frequency: 55, duration: 1.35 },
+  { name: '808 Sub D.wav', kind: '808', frequency: 73.42, duration: 1.25 },
+  { name: '808 Sub G.wav', kind: '808', frequency: 49, duration: 1.45 },
+  { name: 'Bounce Bass A.wav', kind: 'bounce', frequency: 55, duration: 0.42 },
+  { name: 'Bounce Bass C.wav', kind: 'bounce', frequency: 65.41, duration: 0.42 },
+  { name: 'Bounce Bass D.wav', kind: 'bounce', frequency: 73.42, duration: 0.42 },
+  { name: 'Bounce Bass G.wav', kind: 'bounce', frequency: 49, duration: 0.46 },
+];
+
+function synthesizePresetVoice(audio: AudioContext, voice: PresetVoice) {
+  const sampleRate = audio.sampleRate;
+  const buffer = audio.createBuffer(1, Math.max(1, Math.floor(sampleRate * voice.duration)), sampleRate);
+  const output = buffer.getChannelData(0);
+  const baseFrequency = voice.frequency ?? 60;
+  let phase = 0;
+  let previousNoise = 0;
+  let seed = 7619 + Math.round(baseFrequency * 17);
+  const randomNoise = () => {
+    seed = (seed * 16807) % 2147483647;
+    return (seed / 1073741823.5) - 1;
+  };
+
+  for (let index = 0; index < output.length; index++) {
+    const time = index / sampleRate;
+    const noise = randomNoise();
+    const highNoise = noise - previousNoise;
+    previousNoise = noise;
+    let sample = 0;
+
+    switch (voice.kind) {
+      case 'kick': {
+        const frequency = 44 + 112 * Math.exp(-time * 19);
+        phase += (Math.PI * 2 * frequency) / sampleRate;
+        sample = (Math.sin(phase) * Math.exp(-time * 6.8) + noise * 0.09 * Math.exp(-time * 52)) * 0.92;
+        break;
+      }
+      case 'snare': {
+        phase += (Math.PI * 2 * (190 - 34 * Math.min(time, 0.2))) / sampleRate;
+        sample = noise * 0.58 * Math.exp(-time * 17) + Math.sin(phase) * 0.34 * Math.exp(-time * 9);
+        break;
+      }
+      case 'closed-hat':
+      case 'open-hat': {
+        const decay = voice.kind === 'closed-hat' ? 34 : 5.4;
+        sample = highNoise * 0.43 * Math.exp(-time * decay);
+        break;
+      }
+      case 'clap': {
+        const burst = [0, 0.014, 0.029, 0.047].reduce((level, onset) =>
+          level + (time >= onset ? Math.exp(-(time - onset) * 52) : 0), 0);
+        sample = noise * Math.min(1, burst) * 0.62 + noise * 0.13 * Math.exp(-time * 9);
+        break;
+      }
+      case 'rim': {
+        phase += (Math.PI * 2 * 1580) / sampleRate;
+        sample = (Math.sin(phase) * 0.7 + noise * 0.22) * Math.exp(-time * 30);
+        break;
+      }
+      case 'tom': {
+        const frequency = baseFrequency + 70 * Math.exp(-time * 10);
+        phase += (Math.PI * 2 * frequency) / sampleRate;
+        sample = Math.sin(phase) * 0.72 * Math.exp(-time * 7.2) + noise * 0.08 * Math.exp(-time * 45);
+        break;
+      }
+      case 'perc': {
+        phase += (Math.PI * 2 * baseFrequency) / sampleRate;
+        sample = (Math.sin(phase) * 0.58 + highNoise * 0.28) * Math.exp(-time * 26);
+        break;
+      }
+      case '808': {
+        const frequency = baseFrequency * (1 + 1.7 * Math.exp(-time * 12));
+        phase += (Math.PI * 2 * frequency) / sampleRate;
+        sample = Math.tanh((Math.sin(phase) + Math.sin(phase * 2) * 0.12) * 1.8) * 0.7 * Math.exp(-time * 2.45);
+        break;
+      }
+      case 'bounce': {
+        phase += (Math.PI * 2 * baseFrequency) / sampleRate;
+        sample = (Math.sin(phase) + Math.sin(phase * 2) * 0.32 + Math.sin(phase * 3) * 0.13)
+          * 0.43 * Math.exp(-time * 5.2) * (1 - Math.exp(-time * 90));
+        break;
+      }
+    }
+
+    output[index] = Math.max(-1, Math.min(1, sample));
+  }
+  return buffer;
+}
+
+function createBouncy808Preset(audio: AudioContext) {
+  const pads = BOUNCY_808_VOICES.map((voice) => {
+    const buffer = synthesizePresetVoice(audio, voice);
+    return { name: voice.name, duration: buffer.duration, buffer, bars: makeWave(buffer), loop: false, volume: 0.85 };
+  });
+  const steps = Array.from({ length: 16 }, () => Array(16).fill(false) as boolean[]);
+  const hits: [number, number[]][] = [
+    [0, [0, 7, 8, 14]],
+    [1, [4, 12]],
+    [2, [2, 6, 10, 14]],
+    [3, [14]],
+    [4, [4, 12]],
+    [5, [7, 15]],
+    [6, [11]],
+    [8, [0, 10]],
+    [9, [8]],
+    [10, [6, 14]],
+    [11, [12]],
+    [12, [0, 3, 8, 11]],
+    [13, [4]],
+    [14, [10, 15]],
+    [15, [6]],
+  ];
+  hits.forEach(([pad, positions]) => positions.forEach((step) => { steps[pad][step] = true; }));
+  return { pads, steps };
+}
 
 function openSampleDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -187,6 +319,41 @@ function App() {
       setError(reason instanceof Error ? reason.message : 'Audio could not start. Check your browser audio permissions.');
     }
   }, [context]);
+
+  const loadBouncyPreset = useCallback(async () => {
+    const hasLoadedSamples = padsRef.current.some(pad => pad.buffer);
+    if (hasLoadedSamples && !window.confirm('Load Bouncy 808? This replaces the current 16 pads and step pattern.')) return;
+    await unlockAudio();
+    const audio = audioRef.current;
+    if (!audio || audio.state !== 'running') return;
+
+    try {
+      const preset = createBouncy808Preset(audio);
+      if (timerRef.current !== null) stopSequence();
+      sourceRefs.current.forEach(source => { try { source.stop(); } catch { /* already stopped */ } });
+      sourceRefs.current.clear();
+      setActivePads(new Set());
+      setPads(preset.pads);
+      padsRef.current = preset.pads;
+      setSteps(preset.steps);
+      stepsRef.current = preset.steps;
+      setTempo(104);
+      setSelected(0);
+      const saves = await Promise.allSettled(preset.pads.map((pad, index) => {
+        if (!pad.buffer) return Promise.resolve();
+        const wav = new File([encodeWav(pad.buffer)], pad.name, { type: 'audio/wav' });
+        return persistSample(index, wav);
+      }));
+      const allSaved = saves.every(result => result.status === 'fulfilled');
+      setNotice(allSaved
+        ? 'Bouncy 808 loaded · 16 sounds + starter groove saved on this device'
+        : 'Bouncy 808 loaded · local browser storage unavailable; session only');
+      window.setTimeout(() => setNotice(''), 3200);
+      setError('');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'The Bouncy 808 preset could not be loaded.');
+    }
+  }, [stopSequence, unlockAudio]);
 
   const playPad = useCallback(async (index: number) => {
     const pad = padsRef.current[index];
@@ -385,9 +552,14 @@ function App() {
           <h1>Load it. Tap it. Loop it.</h1>
           <p>A little sampler for the sounds already on your device.</p>
         </div>
-        <button className="start-audio" onClick={() => void unlockAudio()} data-testid="button-start-audio">
-          <Headphones size={15} /> {ready ? 'Audio ready' : 'Start audio'} <span aria-hidden="true">↗</span>
-        </button>
+        <div className="intro-actions">
+          <button className="preset-load" onClick={() => void loadBouncyPreset()} data-testid="button-load-bouncy-808">
+            <AudioLines size={15} /> Load Bouncy 808
+          </button>
+          <button className="start-audio" onClick={() => void unlockAudio()} data-testid="button-start-audio">
+            <Headphones size={15} /> {ready ? 'Audio ready' : 'Start audio'} <span aria-hidden="true">↗</span>
+          </button>
+        </div>
       </section>
 
       <section className="workspace">
