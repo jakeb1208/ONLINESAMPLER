@@ -309,6 +309,7 @@ function App() {
             setPads(old => {
               const next = [...old];
               restored.forEach(item => { next[item.index] = item.pad; });
+              padsRef.current = next;
               return next;
             });
             setNotice(`Restored ${restored.length} local sample${restored.length === 1 ? '' : 's'}`);
@@ -321,15 +322,21 @@ function App() {
   }, [context]);
 
   const loadBouncyPreset = useCallback(async () => {
-    const hasLoadedSamples = padsRef.current.some(pad => pad.buffer);
-    if (hasLoadedSamples && !window.confirm('Load Bouncy 808? This replaces the current 16 pads and step pattern.')) return;
+    const hadLoadedSamples = padsRef.current.some(pad => pad.buffer);
+    if (hadLoadedSamples && !window.confirm('Load Bouncy 808? This replaces the current 16 pads and step pattern.')) return;
     await unlockAudio();
     const audio = audioRef.current;
     if (!audio || audio.state !== 'running') return;
+    if (!hadLoadedSamples && padsRef.current.some(pad => pad.buffer)
+      && !window.confirm('Your saved samples were restored. Load Bouncy 808 and replace them with the preset?')) return;
 
     try {
       const preset = createBouncy808Preset(audio);
-      if (timerRef.current !== null) stopSequence();
+      if (timerRef.current !== null) window.clearInterval(timerRef.current);
+      timerRef.current = null;
+      setPlaying(false);
+      setCurrentStep(-1);
+      seqIndexRef.current = -1;
       sourceRefs.current.forEach(source => { try { source.stop(); } catch { /* already stopped */ } });
       sourceRefs.current.clear();
       setActivePads(new Set());
@@ -353,7 +360,7 @@ function App() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'The Bouncy 808 preset could not be loaded.');
     }
-  }, [stopSequence, unlockAudio]);
+  }, [unlockAudio]);
 
   const playPad = useCallback(async (index: number) => {
     const pad = padsRef.current[index];

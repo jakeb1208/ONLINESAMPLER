@@ -69,9 +69,12 @@ button:focus-visible, input:focus-visible { outline: 2px solid #56dc9f; outline-
 .local-pill { display:flex;align-items:center;gap:8px;border:1px solid #343941;border-radius:999px;padding:8px 12px;color:#a7acae;font:10px var(--app-font-mono);letter-spacing:.4px; }
 .local-dot { width:7px;height:7px;border-radius:50%;background:#56dc9f;box-shadow:0 0 10px #56dc9f90; }
 .intro { display:flex;align-items:flex-end;justify-content:space-between;padding:28px 0 24px;gap:24px; }
+.intro-actions { display:flex;align-items:center;gap:9px; }
 .eyebrow { color:#56dc9f;font:10px var(--app-font-mono);letter-spacing:1.7px;text-transform:uppercase; }
 .intro h1 { font-size:clamp(26px,3vw,38px);line-height:1.05;letter-spacing:-1.9px;margin:8px 0 8px;font-weight:600; }
 .intro p { color:#969ba2;margin:0;font-size:13px; }
+.preset-load { display:flex;align-items:center;gap:8px;padding:11px 14px;border-radius:10px;background:#282b30;border:1px solid #6f5a3e;color:#f1bf73;font-weight:700;font-size:12px;cursor:pointer;transition:transform .18s,border-color .18s;white-space:nowrap; }
+.preset-load:hover { border-color:#d6a65e;transform:translateY(-1px); }
 .start-audio { display:flex;align-items:center;gap:9px;padding:11px 15px;border-radius:10px;background:#56dc9f;color:#15231c;font-weight:700;font-size:12px;border:0;cursor:pointer;transition:transform .18s,background .18s;white-space:nowrap; }
 .start-audio:hover { background:#78eab4;transform:translateY(-1px); }
 .workspace { display:grid;grid-template-columns:minmax(0, 1.32fr) minmax(355px,.88fr);gap:18px;align-items:start; }
@@ -169,7 +172,8 @@ input[type=range] { accent-color:#56dc9f;height:4px;cursor:pointer; }
  .local-pill .local-dot { margin:0; }
  .intro { align-items:flex-start;flex-direction:column;padding:22px 0 17px;gap:16px; }
  .intro h1 { font-size:30px; }
- .start-audio { align-self:stretch;justify-content:center; }
+  .intro-actions { align-self:stretch;flex-direction:column;width:100%; }
+  .start-audio,.preset-load { width:100%;justify-content:center; }
  .right-stack { display:flex; }
  .pad-grid { gap:7px;padding:10px; }
  .pad { min-height:95px;padding:8px; }
