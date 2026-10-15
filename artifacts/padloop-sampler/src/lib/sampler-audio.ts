@@ -4,6 +4,45 @@ export type EditableSample = {
   reverse: boolean;
 };
 
+export type RenderSampleOptions = EditableSample & {
+  pitch: number;
+  fadeIn: number;
+  fadeOut: number;
+};
+
+export function renderSample(
+  context: BaseAudioContext,
+  buffer: AudioBuffer,
+  options: RenderSampleOptions,
+) {
+  const startFrame = Math.floor(buffer.length * Math.max(0, Math.min(0.99, options.trimStart)));
+  const endFrame = Math.max(startFrame + 1, Math.floor(buffer.length * Math.max(options.trimStart + 0.01, Math.min(1, options.trimEnd))));
+  const rate = 2 ** (options.pitch / 12);
+  const outputLength = Math.max(1, Math.ceil((endFrame - startFrame) / rate));
+  const rendered = context.createBuffer(buffer.numberOfChannels, outputLength, buffer.sampleRate);
+  const fadeInFrames = Math.max(0, Math.floor(options.fadeIn * buffer.sampleRate));
+  const fadeOutFrames = Math.max(0, Math.floor(options.fadeOut * buffer.sampleRate));
+
+  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+    const source = buffer.getChannelData(channel);
+    const target = rendered.getChannelData(channel);
+    for (let index = 0; index < outputLength; index++) {
+      const position = options.reverse
+        ? endFrame - 1 - index * rate
+        : startFrame + index * rate;
+      const left = Math.max(startFrame, Math.min(endFrame - 1, Math.floor(position)));
+      const right = Math.max(startFrame, Math.min(endFrame - 1, left + (options.reverse ? -1 : 1)));
+      const mix = Math.abs(position - left);
+      let sample = source[left] * (1 - mix) + source[right] * mix;
+      const fadeIn = fadeInFrames ? Math.min(1, index / fadeInFrames) : 1;
+      const fadeOut = fadeOutFrames ? Math.min(1, (outputLength - index - 1) / fadeOutFrames) : 1;
+      sample *= Math.max(0, Math.min(fadeIn, fadeOut));
+      target[index] = sample;
+    }
+  }
+  return rendered;
+}
+
 export function reverseBuffer(context: BaseAudioContext, buffer: AudioBuffer) {
   const reversed = context.createBuffer(buffer.numberOfChannels, buffer.length, buffer.sampleRate);
   for (let channel = 0; channel < buffer.numberOfChannels; channel++) {

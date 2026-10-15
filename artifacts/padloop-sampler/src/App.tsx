@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { Activity, AudioLines, Download, FileAudio2, Headphones, Pause, Play, Plus, Repeat, Upload, Volume2, X } from 'lucide-react';
+import { buildMidiFile, buildZip } from './lib/daw-export';
+import { detectBpm, makeImpulse, renderSample, reverseBuffer, sliceBuffer, stretchBuffer } from './lib/sampler-audio';
 
 type Pad = {
   name: string;
@@ -8,6 +10,25 @@ type Pad = {
   bars: number[];
   loop: boolean;
   volume: number;
+  triggerMode: 'one-shot' | 'gate';
+  velocitySensitive: boolean;
+  chokeGroup: string;
+  trimStart: number;
+  trimEnd: number;
+  fadeIn: number;
+  fadeOut: number;
+  reverse: boolean;
+  pitch: number;
+  attack: number;
+  decay: number;
+  sustain: number;
+  release: number;
+  filterCutoff: number;
+  distortion: number;
+  probability: number;
+  ratchets: number;
+  flam: boolean;
+  detectedBpm: number | null;
 };
 
 type PresetVoice = {
@@ -19,10 +40,32 @@ type PresetVoice = {
 
 const PAD_KEYS = ['Q', 'W', 'E', 'R', 'A', 'S', 'D', 'F', 'Z', 'X', 'C', 'V', '1', '2', '3', '4'];
 const padColors = ['#f1b95e', '#e88e70', '#75c9a4', '#a4a1dc', '#e9829c', '#79b9dc', '#d3a66d', '#78c8ad', '#db8d66', '#90b5da', '#b4a2d9', '#d5bd6b', '#75c6b1', '#df8e87', '#86b7dc', '#b1a0d5'];
-const emptyPad = (): Pad => ({ name: '', duration: 0, buffer: null, bars: [], loop: false, volume: 0.85 });
+const emptyPad = (): Pad => ({
+  name: '', duration: 0, buffer: null, bars: [], loop: false, volume: 0.85,
+  triggerMode: 'one-shot', velocitySensitive: true, chokeGroup: '',
+  trimStart: 0, trimEnd: 1, fadeIn: 0.005, fadeOut: 0.03, reverse: false, pitch: 0,
+  attack: 0.005, decay: 0.08, sustain: 0.85, release: 0.15,
+  filterCutoff: 18000, distortion: 0, probability: 100, ratchets: 1, flam: false,
+  detectedBpm: null,
+});
 const makePads = () => Array.from({ length: 16 }, emptyPad);
+const makeEmptyPattern = () => Array.from({ length: 16 }, () => Array(16).fill(false) as boolean[]);
 const DB_NAME = 'padloop-local-kit';
 const DB_STORE = 'samples';
+const KIT_STORE = 'kits';
+
+type SavedKit = {
+  name: string;
+  savedAt: string;
+  tempo: number;
+  master: number;
+  swing: number;
+  quantize: number;
+  effects: { reverb: number; delay: number };
+  patterns: boolean[][][];
+  arrangement: number[];
+  pads: Array<Omit<Pad, 'buffer' | 'bars'> & { sample: Blob | null }>;
+};
 
 const BOUNCY_808_VOICES: PresetVoice[] = [
   { name: 'Punch Kick.wav', kind: 'kick', duration: 0.72 },
@@ -125,7 +168,7 @@ function synthesizePresetVoice(audio: AudioContext, voice: PresetVoice) {
 function createBouncy808Preset(audio: AudioContext) {
   const pads = BOUNCY_808_VOICES.map((voice) => {
     const buffer = synthesizePresetVoice(audio, voice);
-    return { name: voice.name, duration: buffer.duration, buffer, bars: makeWave(buffer), loop: false, volume: 0.85 };
+    return { ...emptyPad(), name: voice.name, duration: buffer.duration, buffer, bars: makeWave(buffer) };
   });
   const steps = Array.from({ length: 16 }, () => Array(16).fill(false) as boolean[]);
   const hits: [number, number[]][] = [
@@ -152,11 +195,56 @@ function createBouncy808Preset(audio: AudioContext) {
 function openSampleDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     if (!('indexedDB' in window)) return reject(new Error('Local sample storage is unavailable in this browser.'));
-    const request = indexedDB.open(DB_NAME, 1);
-    request.onupgradeneeded = () => request.result.createObjectStore(DB_STORE);
+    const request = indexedDB.open(DB_NAME, 2);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(DB_STORE)) request.result.createObjectStore(DB_STORE);
+      if (!request.result.objectStoreNames.contains(KIT_STORE)) request.result.createObjectStore(KIT_STORE);
+    };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error('Could not open local sample storage.'));
   });
+}
+
+async function listSavedKits() {
+  const db = await openSampleDb();
+  const names = await new Promise<string[]>((resolve, reject) => {
+    const request = db.transaction(KIT_STORE, 'readonly').objectStore(KIT_STORE).getAllKeys();
+    request.onsuccess = () => resolve(request.result.map(String).sort((a, b) => a.localeCompare(b)));
+    request.onerror = () => reject(request.error);
+  });
+  db.close();
+  return names;
+}
+
+async function saveKitRecord(name: string, kit: SavedKit) {
+  const db = await openSampleDb();
+  await new Promise<void>((resolve, reject) => {
+    const request = db.transaction(KIT_STORE, 'readwrite').objectStore(KIT_STORE).put(kit, name);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+  db.close();
+}
+
+async function readKitRecord(name: string) {
+  const db = await openSampleDb();
+  const kit = await new Promise<SavedKit | undefined>((resolve, reject) => {
+    const request = db.transaction(KIT_STORE, 'readonly').objectStore(KIT_STORE).get(name);
+    request.onsuccess = () => resolve(request.result as SavedKit | undefined);
+    request.onerror = () => reject(request.error);
+  });
+  db.close();
+  return kit ?? null;
+}
+
+async function deleteKitRecord(name: string) {
+  const db = await openSampleDb();
+  await new Promise<void>((resolve, reject) => {
+    const request = db.transaction(KIT_STORE, 'readwrite').objectStore(KIT_STORE).delete(name);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+  db.close();
 }
 
 async function persistSample(index: number, file: File) {
@@ -203,7 +291,7 @@ async function restoreSamples(context: AudioContext) {
     const file = files[position];
     try {
       const buffer = await context.decodeAudioData(await file.arrayBuffer());
-      result.push({ index: Number(key), pad: { name: file instanceof File ? file.name : `sample-${Number(key) + 1}.wav`, duration: buffer.duration, buffer, bars: makeWave(buffer), loop: false, volume: 0.85 } });
+      result.push({ index: Number(key), pad: { ...emptyPad(), name: file instanceof File ? file.name : `sample-${Number(key) + 1}.wav`, duration: buffer.duration, buffer, bars: makeWave(buffer) } });
     } catch { /* A stale or unsupported local file is skipped safely. */ }
   }
   db.close();
@@ -260,10 +348,17 @@ function saveBlob(blob: Blob, name: string) {
 
 function App() {
   const [pads, setPads] = useState<Pad[]>(makePads);
-  const [steps, setSteps] = useState<boolean[][]>(() => Array.from({ length: 16 }, () => Array(16).fill(false)));
+  const [patterns, setPatterns] = useState<boolean[][][]>(() => Array.from({ length: 4 }, makeEmptyPattern));
+  const [currentPattern, setCurrentPattern] = useState(0);
+  const [arrangement, setArrangement] = useState([0, 1, 0, 1]);
   const [selected, setSelected] = useState(0);
   const [tempo, setTempo] = useState(96);
   const [master, setMaster] = useState(.8);
+  const [swing, setSwing] = useState(0);
+  const [quantize, setQuantize] = useState(1);
+  const [recordMode, setRecordMode] = useState(false);
+  const [songPlaying, setSongPlaying] = useState(false);
+  const [effects, setEffects] = useState({ reverb: 0.08, delay: 0.04 });
   const [playing, setPlaying] = useState(false);
   const [currentStep, setCurrentStep] = useState(-1);
   const [notice, setNotice] = useState('');
@@ -271,17 +366,40 @@ function App() {
   const [dragging, setDragging] = useState(false);
   const [ready, setReady] = useState(false);
   const [activePads, setActivePads] = useState<Set<number>>(() => new Set());
+  const [kitName, setKitName] = useState('My kit');
+  const [savedKits, setSavedKits] = useState<string[]>([]);
+  const [selectedKit, setSelectedKit] = useState('');
+  const [sliceCount, setSliceCount] = useState(8);
   const audioRef = useRef<AudioContext | null>(null);
   const masterRef = useRef<GainNode | null>(null);
   const sourceRefs = useRef<Map<number, AudioBufferSourceNode>>(new Map());
+  const voiceSourcesRef = useRef<Map<number, Set<AudioBufferSourceNode>>>(new Map());
+  const voiceGainRefs = useRef<Map<number, GainNode>>(new Map());
+  const reverbSendRef = useRef<GainNode | null>(null);
+  const delaySendRef = useRef<GainNode | null>(null);
+  const delayFeedbackRef = useRef<GainNode | null>(null);
+  const delayTimeRef = useRef<DelayNode | null>(null);
+  const reverseBuffersRef = useRef<WeakMap<AudioBuffer, AudioBuffer>>(new WeakMap());
+  const scheduledTimersRef = useRef<Set<number>>(new Set());
+  const pointerVelocityRef = useRef<Map<number, number>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
   const timerRef = useRef<number | null>(null);
   const seqIndexRef = useRef(-1);
   const selectedRef = useRef(0);
   const padsRef = useRef(pads);
+  const patternsRef = useRef(patterns);
+  const steps = patterns[currentPattern];
   const stepsRef = useRef(steps);
+  const currentPatternRef = useRef(currentPattern);
+  const arrangementRef = useRef(arrangement);
+  const swingRef = useRef(swing);
+  const tempoRef = useRef(tempo);
   const masterValueRef = useRef(master);
-  padsRef.current = pads; stepsRef.current = steps; selectedRef.current = selected; masterValueRef.current = master;
+  const effectsRef = useRef(effects);
+  padsRef.current = pads; patternsRef.current = patterns; stepsRef.current = steps;
+  selectedRef.current = selected; currentPatternRef.current = currentPattern;
+  arrangementRef.current = arrangement; swingRef.current = swing; tempoRef.current = tempo;
+  masterValueRef.current = master; effectsRef.current = effects;
 
   const context = useCallback(() => {
     if (!audioRef.current) {
@@ -292,6 +410,32 @@ function App() {
       gain.gain.value = masterValueRef.current;
       gain.connect(audioRef.current.destination);
       masterRef.current = gain;
+      const convolver = audioRef.current.createConvolver();
+      convolver.buffer = makeImpulse(audioRef.current);
+      const reverbInput = audioRef.current.createGain();
+      const reverbWet = audioRef.current.createGain();
+      reverbInput.gain.value = effectsRef.current.reverb;
+      reverbInput.connect(convolver);
+      convolver.connect(reverbWet);
+      reverbWet.gain.value = 0.32;
+      reverbWet.connect(gain);
+      const delayInput = audioRef.current.createGain();
+      const delay = audioRef.current.createDelay(1.5);
+      const feedback = audioRef.current.createGain();
+      const delayWet = audioRef.current.createGain();
+      delayInput.gain.value = effectsRef.current.delay;
+      delay.delayTime.value = 0.28;
+      feedback.gain.value = 0.26;
+      delayWet.gain.value = 0.45;
+      delayInput.connect(delay);
+      delay.connect(feedback);
+      feedback.connect(delay);
+      delay.connect(delayWet);
+      delayWet.connect(gain);
+      reverbSendRef.current = reverbInput;
+      delaySendRef.current = delayInput;
+      delayFeedbackRef.current = feedback;
+      delayTimeRef.current = delay;
     }
     return audioRef.current;
   }, []);
@@ -308,7 +452,17 @@ function App() {
           if (restored.length) {
             setPads(old => {
               const next = [...old];
-              restored.forEach(item => { next[item.index] = item.pad; });
+            restored.forEach(item => {
+              const settings = next[item.index];
+              next[item.index] = {
+                ...item.pad,
+                ...settings,
+                buffer: item.pad.buffer,
+                bars: item.pad.bars,
+                duration: item.pad.duration,
+                name: item.pad.name,
+              };
+            });
               padsRef.current = next;
               return next;
             });
@@ -332,18 +486,29 @@ function App() {
 
     try {
       const preset = createBouncy808Preset(audio);
-      if (timerRef.current !== null) window.clearInterval(timerRef.current);
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+      scheduledTimersRef.current.forEach(timer => window.clearTimeout(timer));
+      scheduledTimersRef.current.clear();
       timerRef.current = null;
       setPlaying(false);
+      setSongPlaying(false);
       setCurrentStep(-1);
       seqIndexRef.current = -1;
+      voiceSourcesRef.current.forEach(voices => voices.forEach(source => { try { source.stop(); } catch { /* already stopped */ } }));
+      voiceSourcesRef.current.clear();
       sourceRefs.current.forEach(source => { try { source.stop(); } catch { /* already stopped */ } });
       sourceRefs.current.clear();
+      voiceGainRefs.current.clear();
       setActivePads(new Set());
       setPads(preset.pads);
       padsRef.current = preset.pads;
-      setSteps(preset.steps);
+      const presetPatterns = [preset.steps, makeEmptyPattern(), makeEmptyPattern(), makeEmptyPattern()];
+      setPatterns(presetPatterns);
+      patternsRef.current = presetPatterns;
+      setCurrentPattern(0);
       stepsRef.current = preset.steps;
+      setArrangement([0, 1, 0, 1]);
+      arrangementRef.current = [0, 1, 0, 1];
       setTempo(104);
       setSelected(0);
       const saves = await Promise.allSettled(preset.pads.map((pad, index) => {
@@ -362,7 +527,7 @@ function App() {
     }
   }, [unlockAudio]);
 
-  const playPad = useCallback(async (index: number) => {
+  const playPad = useCallback(async (index: number, velocity = 1, gateDuration?: number) => {
     const pad = padsRef.current[index];
     if (!pad?.buffer) {
       setSelected(index);
@@ -371,77 +536,363 @@ function App() {
     try {
       const audio = context();
       if (audio.state !== 'running') await audio.resume();
+      const isLooping = pad.loop || pad.triggerMode === 'gate';
+      if (pad.chokeGroup) {
+        const chokedPads: number[] = [];
+        sourceRefs.current.forEach((activeSource, activeIndex) => {
+          if (activeIndex !== index && padsRef.current[activeIndex]?.chokeGroup === pad.chokeGroup) {
+            const voices = voiceSourcesRef.current.get(activeIndex);
+            if (voices?.size) voices.forEach(voice => { try { voice.stop(); } catch { /* already stopped */ } });
+            else { try { activeSource.stop(); } catch { /* already stopped */ } }
+            sourceRefs.current.delete(activeIndex);
+            voiceSourcesRef.current.delete(activeIndex);
+            voiceGainRefs.current.delete(activeIndex);
+            chokedPads.push(activeIndex);
+          }
+        });
+        if (chokedPads.length) setActivePads(old => {
+          const next = new Set(old);
+          chokedPads.forEach(activeIndex => next.delete(activeIndex));
+          return next;
+        });
+      }
       const previous = sourceRefs.current.get(index);
-      if (previous) { try { previous.stop(); } catch { /* already stopped */ } }
+      if (isLooping) {
+        const previousVoices = voiceSourcesRef.current.get(index);
+        if (previousVoices?.size) previousVoices.forEach(voice => { try { voice.stop(); } catch { /* already stopped */ } });
+        else if (previous) { try { previous.stop(); } catch { /* already stopped */ } }
+        voiceSourcesRef.current.delete(index);
+        sourceRefs.current.delete(index);
+      }
+
+      let sample = pad.buffer;
+      if (pad.reverse) {
+        let reversed = reverseBuffersRef.current.get(sample);
+        if (!reversed) {
+          reversed = reverseBuffer(audio, sample);
+          reverseBuffersRef.current.set(sample, reversed);
+        }
+        sample = reversed;
+      }
+      const trimStart = Math.max(0, Math.min(0.99, pad.trimStart));
+      const trimEnd = Math.max(trimStart + 0.01, Math.min(1, pad.trimEnd));
+      const regionDuration = (trimEnd - trimStart) * sample.duration;
+      const offset = pad.reverse ? (1 - trimEnd) * sample.duration : trimStart * sample.duration;
+      const playbackRate = 2 ** (pad.pitch / 12);
+      const now = audio.currentTime + 0.005;
+      const duration = regionDuration / playbackRate;
+      const velocityGain = pad.volume * (pad.velocitySensitive ? Math.max(0.08, Math.min(1, velocity)) : 1);
       const source = audio.createBufferSource();
       const gain = audio.createGain();
-      source.buffer = pad.buffer;
-      source.loop = pad.loop;
-      gain.gain.value = pad.volume;
-      source.connect(gain);
+      const filter = audio.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = pad.filterCutoff;
+      source.buffer = sample;
+      source.playbackRate.value = playbackRate;
+      source.loop = isLooping;
+      if (isLooping) {
+        source.loopStart = pad.reverse ? (1 - trimEnd) * sample.duration : trimStart * sample.duration;
+        source.loopEnd = pad.reverse ? (1 - trimStart) * sample.duration : trimEnd * sample.duration;
+      }
+
+      let lastNode: AudioNode = filter;
+      source.connect(filter);
+      if (pad.distortion > 0) {
+        const shaper = audio.createWaveShaper();
+        const amount = 1 + pad.distortion * 75;
+        const curve = new Float32Array(2048);
+        for (let point = 0; point < curve.length; point++) {
+          const x = (point * 2) / (curve.length - 1) - 1;
+          curve[point] = Math.tanh(x * amount) / Math.tanh(amount);
+        }
+        shaper.curve = curve;
+        shaper.oversample = '2x';
+        lastNode.connect(shaper);
+        lastNode = shaper;
+      }
+      lastNode.connect(gain);
       gain.connect(masterRef.current ?? audio.destination);
+      if (reverbSendRef.current) { gain.connect(reverbSendRef.current); reverbSendRef.current.gain.value = effectsRef.current.reverb; }
+      if (delaySendRef.current) { gain.connect(delaySendRef.current); delaySendRef.current.gain.value = effectsRef.current.delay; }
+      const attack = pad.triggerMode === 'gate' ? pad.attack : pad.fadeIn;
+      const decay = Math.min(pad.decay, Math.max(0, duration - attack));
+      const sustainLevel = velocityGain * pad.sustain;
+      gain.gain.setValueAtTime(0, now);
+      gain.gain.linearRampToValueAtTime(velocityGain, now + Math.max(0.001, attack));
+      gain.gain.linearRampToValueAtTime(sustainLevel, now + Math.max(0.002, attack + decay));
+      if (!isLooping) {
+        const fade = Math.min(pad.fadeOut, duration);
+        const fadeStart = Math.max(now + attack + decay, now + duration - fade);
+        gain.gain.setValueAtTime(sustainLevel, fadeStart);
+        gain.gain.linearRampToValueAtTime(0, now + duration);
+      }
       sourceRefs.current.set(index, source);
+      const voices = voiceSourcesRef.current.get(index) ?? new Set<AudioBufferSourceNode>();
+      voices.add(source);
+      voiceSourcesRef.current.set(index, voices);
+      voiceGainRefs.current.set(index, gain);
       setActivePads(old => new Set(old).add(index));
       source.onended = () => {
+        const activeVoices = voiceSourcesRef.current.get(index);
+        activeVoices?.delete(source);
         if (sourceRefs.current.get(index) === source) {
-          sourceRefs.current.delete(index);
+          const latest = activeVoices?.values().next().value as AudioBufferSourceNode | undefined;
+          if (latest) sourceRefs.current.set(index, latest);
+          else sourceRefs.current.delete(index);
+        }
+        if (!activeVoices?.size) {
+          voiceSourcesRef.current.delete(index);
+          voiceGainRefs.current.delete(index);
           setActivePads(old => { const next = new Set(old); next.delete(index); return next; });
         }
       };
-      source.start();
+      if (gateDuration !== undefined && isLooping) {
+        const releaseAt = now + gateDuration;
+        gain.gain.setValueAtTime(sustainLevel, releaseAt);
+        gain.gain.linearRampToValueAtTime(0, releaseAt + pad.release);
+        source.start(now, offset);
+        source.stop(releaseAt + pad.release + 0.01);
+      } else if (isLooping) {
+        source.start(now, offset);
+      } else {
+        source.start(now, offset, regionDuration);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'This sound could not be played.');
     }
   }, [context]);
 
+  const releasePad = useCallback((index: number) => {
+    const pad = padsRef.current[index];
+    if (pad?.triggerMode !== 'gate') return;
+    const audio = audioRef.current;
+    const source = sourceRefs.current.get(index);
+    const gain = voiceGainRefs.current.get(index);
+    if (!audio || !source || !gain) return;
+    const stopAt = audio.currentTime + pad.release;
+    gain.gain.cancelScheduledValues(audio.currentTime);
+    gain.gain.setTargetAtTime(0, audio.currentTime, Math.max(0.008, pad.release / 4));
+    try { source.stop(stopAt + 0.02); } catch { /* already stopped */ }
+  }, []);
+
+  const stopPad = useCallback((index: number) => {
+    const voices = voiceSourcesRef.current.get(index);
+    if (voices?.size) voices.forEach(source => { try { source.stop(); } catch { /* already stopped */ } });
+    else {
+      const source = sourceRefs.current.get(index);
+      if (source) { try { source.stop(); } catch { /* already stopped */ } }
+    }
+    voiceSourcesRef.current.delete(index);
+    sourceRefs.current.delete(index);
+    voiceGainRefs.current.delete(index);
+    setActivePads(old => { const next = new Set(old); next.delete(index); return next; });
+  }, []);
+
+  const updatePad = (index: number, changes: Partial<Pad>) => {
+    setPads(old => old.map((pad, slot) => slot === index ? { ...pad, ...changes } : pad));
+  };
+
+  const updateCurrentPattern = (updater: (pattern: boolean[][]) => boolean[][]) => {
+    setPatterns(old => old.map((pattern, index) => index === currentPattern ? updater(pattern) : pattern));
+  };
+
+  const saveCurrentKit = async () => {
+    const name = kitName.trim();
+    if (!name) { setError('Give this kit a name before saving.'); return; }
+    try {
+      const record: SavedKit = {
+        name,
+        savedAt: new Date().toISOString(),
+        tempo,
+        master,
+        swing,
+        quantize,
+        effects,
+        patterns,
+        arrangement,
+        pads: pads.map(({ buffer, bars: _bars, ...settings }) => ({ ...settings, sample: buffer ? encodeWav(buffer) : null })),
+      };
+      await saveKitRecord(name, record);
+      const names = await listSavedKits();
+      setSavedKits(names);
+      setSelectedKit(name);
+      setError('');
+      setNotice(`“${name}” saved on this device`);
+      window.setTimeout(() => setNotice(''), 2600);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'This kit could not be saved in browser storage.');
+    }
+  };
+
+  const loadSavedKit = async () => {
+    if (!selectedKit) return;
+    if (padsRef.current.some(pad => pad.buffer) && !window.confirm(`Load “${selectedKit}”? This replaces the current pads and session settings.`)) return;
+    await unlockAudio();
+    const audio = audioRef.current;
+    if (!audio || audio.state !== 'running') return;
+    try {
+      const record = await readKitRecord(selectedKit);
+      if (!record) throw new Error('That saved kit is no longer available.');
+      const loadedPads = await Promise.all(record.pads.map(async ({ sample, ...settings }) => {
+        const buffer = sample ? await audio.decodeAudioData(await sample.arrayBuffer()) : null;
+        return { ...emptyPad(), ...settings, buffer, duration: buffer?.duration ?? 0, bars: buffer ? makeWave(buffer) : [] };
+      }));
+      stopSequence();
+      voiceSourcesRef.current.forEach(voices => voices.forEach(source => { try { source.stop(); } catch { /* already stopped */ } }));
+      voiceSourcesRef.current.clear();
+      sourceRefs.current.forEach(source => { try { source.stop(); } catch { /* already stopped */ } });
+      sourceRefs.current.clear();
+      voiceGainRefs.current.clear();
+      setActivePads(new Set());
+      setPads(loadedPads);
+      padsRef.current = loadedPads;
+      setPatterns(record.patterns);
+      patternsRef.current = record.patterns;
+      setCurrentPattern(0);
+      stepsRef.current = record.patterns[0] ?? makeEmptyPattern();
+      setArrangement(record.arrangement);
+      arrangementRef.current = record.arrangement;
+      setTempo(record.tempo);
+      tempoRef.current = record.tempo;
+      setMaster(record.master);
+      setSwing(record.swing ?? 0);
+      setQuantize(record.quantize ?? 1);
+      setEffects(record.effects);
+      setKitName(record.name);
+      setSelected(0);
+      setError('');
+      setNotice(`Loaded “${selectedKit}”`);
+      window.setTimeout(() => setNotice(''), 2600);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'This kit could not be loaded.');
+    }
+  };
+
+  const removeSavedKit = async () => {
+    if (!selectedKit) return;
+    if (!window.confirm(`Delete the saved kit “${selectedKit}” from this device?`)) return;
+    try {
+      await deleteKitRecord(selectedKit);
+      const names = await listSavedKits();
+      setSavedKits(names);
+      setSelectedKit(names[0] ?? '');
+      setError('');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'This kit could not be deleted.');
+    }
+  };
+
   useEffect(() => {
     try {
       const saved = localStorage.getItem('padloop-kit-meta');
       if (saved) {
-        const meta = JSON.parse(saved) as { tempo?: number; master?: number; steps?: boolean[][]; pads?: { volume?: number; loop?: boolean }[] };
+        const meta = JSON.parse(saved) as {
+          tempo?: number; master?: number; steps?: boolean[][]; patterns?: boolean[][][];
+          currentPattern?: number; arrangement?: number[]; swing?: number; quantize?: number;
+          effects?: { reverb?: number; delay?: number }; pads?: Partial<Pad>[];
+        };
         if (meta.tempo) setTempo(Math.min(180, Math.max(50, meta.tempo)));
         if (meta.master !== undefined) setMaster(meta.master);
-        if (meta.steps?.length === 16) setSteps(meta.steps);
-        if (meta.pads?.length === 16) setPads(old => old.map((pad, index) => ({ ...pad, volume: meta.pads?.[index]?.volume ?? pad.volume, loop: meta.pads?.[index]?.loop ?? pad.loop })));
+        if (meta.patterns?.length === 4 && meta.patterns.every(pattern => pattern.length === 16)) setPatterns(meta.patterns);
+        else if (meta.steps?.length === 16) setPatterns(old => old.map((pattern, index) => index === 0 ? meta.steps! : pattern));
+        if (meta.currentPattern !== undefined) setCurrentPattern(Math.max(0, Math.min(3, meta.currentPattern)));
+        if (meta.arrangement?.length === 4) setArrangement(meta.arrangement.map(value => Math.max(0, Math.min(3, value))));
+        if (meta.swing !== undefined) setSwing(Math.max(0, Math.min(0.6, meta.swing)));
+        if (meta.quantize !== undefined) setQuantize(Math.max(1, Math.min(4, meta.quantize)));
+        if (meta.effects) setEffects({ reverb: meta.effects.reverb ?? 0.08, delay: meta.effects.delay ?? 0.04 });
+        if (meta.pads?.length === 16) setPads(old => old.map((pad, index) => ({ ...pad, ...meta.pads?.[index] })));
       }
     } catch { /* Ignore malformed browser-local metadata. */ }
   }, []);
 
   useEffect(() => {
-    const metadata = { tempo, master, steps, pads: pads.map(({ volume, loop }) => ({ volume, loop })) };
+    const metadata = {
+      tempo, master, patterns, currentPattern, arrangement, swing, quantize, effects,
+      pads: pads.map(({ buffer: _buffer, bars: _bars, ...settings }) => settings),
+    };
     try { localStorage.setItem('padloop-kit-meta', JSON.stringify(metadata)); } catch { /* Storage can be disabled or full. */ }
-  }, [tempo, master, steps, pads]);
+  }, [tempo, master, patterns, currentPattern, arrangement, swing, quantize, effects, pads]);
+
+  useEffect(() => {
+    void listSavedKits().then(setSavedKits).catch(() => setSavedKits([]));
+  }, []);
 
   useEffect(() => {
     if (masterRef.current) masterRef.current.gain.setTargetAtTime(master, audioRef.current?.currentTime ?? 0, .015);
   }, [master]);
 
+  useEffect(() => {
+    if (reverbSendRef.current) reverbSendRef.current.gain.setTargetAtTime(effects.reverb, audioRef.current?.currentTime ?? 0, .025);
+    if (delaySendRef.current) delaySendRef.current.gain.setTargetAtTime(effects.delay, audioRef.current?.currentTime ?? 0, .025);
+  }, [effects]);
+
   const stopSequence = useCallback(() => {
-    if (timerRef.current !== null) window.clearInterval(timerRef.current);
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    scheduledTimersRef.current.forEach(timer => window.clearTimeout(timer));
+    scheduledTimersRef.current.clear();
     timerRef.current = null;
     setPlaying(false);
+    setSongPlaying(false);
     setCurrentStep(-1);
     seqIndexRef.current = -1;
   }, []);
 
-  const startSequence = useCallback(async () => {
+  const startSequence = useCallback(async (mode: 'pattern' | 'song' = 'pattern') => {
     await unlockAudio();
     const audio = audioRef.current;
     if (!audio || audio.state !== 'running') return;
-    if (timerRef.current !== null) window.clearInterval(timerRef.current);
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    scheduledTimersRef.current.forEach(timer => window.clearTimeout(timer));
+    scheduledTimersRef.current.clear();
     setPlaying(true);
+    setSongPlaying(mode === 'song');
+    seqIndexRef.current = -1;
     const tick = () => {
-      seqIndexRef.current = (seqIndexRef.current + 1) % 16;
-      const index = seqIndexRef.current;
-      setCurrentStep(index);
-      for (let pad = 0; pad < 16; pad++) if (stepsRef.current[pad][index]) void playPad(pad);
+      const absoluteStep = seqIndexRef.current + 1;
+      const bar = Math.floor(absoluteStep / 16);
+      if (mode === 'song' && bar >= arrangementRef.current.length) {
+        stopSequence();
+        return;
+      }
+      const patternIndex = mode === 'song' ? arrangementRef.current[bar] : currentPatternRef.current;
+      const stepIndex = absoluteStep % 16;
+      seqIndexRef.current = absoluteStep;
+      if (mode === 'song') setCurrentPattern(patternIndex);
+      setCurrentStep(stepIndex);
+      const pattern = patternsRef.current[patternIndex] ?? makeEmptyPattern();
+      const stepDuration = 60000 / Math.max(50, tempoRef.current) / 4;
+      for (let padIndex = 0; padIndex < 16; padIndex++) {
+        const pad = padsRef.current[padIndex];
+        if (!pattern[padIndex]?.[stepIndex] || Math.random() * 100 > pad.probability) continue;
+        void playPad(padIndex, 0.88, stepDuration / 1000);
+        const ratchetCount = Math.max(1, Math.min(4, pad.ratchets));
+        for (let hit = 1; hit < ratchetCount; hit++) {
+          const timer = window.setTimeout(() => {
+            scheduledTimersRef.current.delete(timer);
+            void playPad(padIndex, Math.max(0.55, 0.9 - hit * 0.08), stepDuration / (ratchetCount * 1000));
+          }, (stepDuration * hit) / ratchetCount);
+          scheduledTimersRef.current.add(timer);
+        }
+        if (pad.flam) {
+          const timer = window.setTimeout(() => {
+            scheduledTimersRef.current.delete(timer);
+            void playPad(padIndex, 0.62, stepDuration / 1000);
+          }, 28);
+          scheduledTimersRef.current.add(timer);
+        }
+      }
+      const isOffbeat = stepIndex % 2 === 1;
+      const swingFactor = Math.max(0, Math.min(0.6, swingRef.current));
+      const delay = stepDuration * (isOffbeat ? 1 + swingFactor * 0.45 : 1 - swingFactor * 0.45);
+      timerRef.current = window.setTimeout(tick, delay);
     };
     tick();
-    timerRef.current = window.setInterval(tick, 60000 / Math.max(50, tempo) / 4);
-  }, [playPad, tempo, unlockAudio]);
+  }, [playPad, stopSequence, unlockAudio]);
 
   useEffect(() => () => {
-    if (timerRef.current !== null) window.clearInterval(timerRef.current);
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    scheduledTimersRef.current.forEach(timer => window.clearTimeout(timer));
+    voiceSourcesRef.current.forEach(voices => voices.forEach(source => { try { source.stop(); } catch { /* already stopped */ } }));
     sourceRefs.current.forEach(source => { try { source.stop(); } catch { /* already stopped */ } });
     void audioRef.current?.close();
   }, []);
@@ -465,80 +916,348 @@ function App() {
     }
   }, [context]);
 
+  const detectSelectedBpm = () => {
+    if (!current.buffer) return;
+    const bpm = detectBpm(current.buffer);
+    if (!bpm) { setError('Could not find a steady BPM in this sample. Try a drum loop with clear transients.'); return; }
+    updatePad(selected, { detectedBpm: bpm });
+    setTempo(bpm);
+    setError('');
+    setNotice(`Detected about ${bpm} BPM`);
+    window.setTimeout(() => setNotice(''), 2400);
+  };
+
+  const stretchSelectedToTempo = async () => {
+    if (!current.buffer) return;
+    const audio = context();
+    if (audio.state !== 'running') await audio.resume();
+    const sourceBpm = current.detectedBpm ?? detectBpm(current.buffer);
+    if (!sourceBpm) { setError('Detect BPM first, or use a loop with a clear beat.'); return; }
+    try {
+      const ratio = sourceBpm / tempo;
+      if (ratio < 0.5 || ratio > 2) {
+        setError('That tempo change is outside the supported 2× stretch range. Choose a closer target BPM.');
+        return;
+      }
+      let region = sliceBuffer(audio, current.buffer, 1, current.trimStart, current.trimEnd)[0];
+      if (current.reverse) region = reverseBuffer(audio, region);
+      const stretched = stretchBuffer(audio, region, ratio);
+      const updated = { ...current, buffer: stretched, duration: stretched.duration, bars: makeWave(stretched), trimStart: 0, trimEnd: 1, reverse: false, detectedBpm: tempo };
+      setPads(old => old.map((pad, index) => index === selected ? updated : pad));
+      try {
+        await persistSample(selected, new File([encodeWav(stretched)], current.name || `pad-${selected + 1}.wav`, { type: 'audio/wav' }));
+        setNotice(`Sample stretched to ${tempo} BPM · pitch preserved`);
+      } catch {
+        setNotice(`Sample stretched to ${tempo} BPM for this session`);
+      }
+      setError('');
+      window.setTimeout(() => setNotice(''), 2600);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'This sample could not be stretched.');
+    }
+  };
+
+  const sliceSelectedSample = async () => {
+    if (!current.buffer) return;
+    const targets = Array.from({ length: sliceCount }, (_, index) => (selected + index) % 16);
+    if (targets.some(index => index !== selected && pads[index].buffer)
+      && !window.confirm(`Slice this sample across ${sliceCount} pads? Existing samples in those slots will be replaced.`)) return;
+    const audio = context();
+    try {
+      let source = current.buffer;
+      if (current.reverse) source = reverseBuffer(audio, source);
+      const slices = sliceBuffer(audio, source, sliceCount, current.trimStart, current.trimEnd);
+      const slicedPads = [...pads];
+      slices.forEach((buffer, sliceIndex) => {
+        const padIndex = targets[sliceIndex];
+        slicedPads[padIndex] = {
+          ...emptyPad(),
+          name: `${current.name.replace(/\.[^.]+$/, '')} slice ${String(sliceIndex + 1).padStart(2, '0')}.wav`,
+          buffer,
+          duration: buffer.duration,
+          bars: makeWave(buffer),
+        };
+      });
+      setPads(slicedPads);
+      padsRef.current = slicedPads;
+      setSelected(targets[0]);
+      await Promise.allSettled(slices.map((buffer, sliceIndex) => {
+        const padIndex = targets[sliceIndex];
+        const slicePad = slicedPads[padIndex];
+        return persistSample(padIndex, new File([encodeWav(buffer)], slicePad.name, { type: 'audio/wav' }));
+      }));
+      setNotice(`Split into ${sliceCount} playable slices`);
+      setError('');
+      window.setTimeout(() => setNotice(''), 2600);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'This sample could not be sliced.');
+    }
+  };
+
+  const handlePadHit = (index: number, velocity = 0.88) => {
+    setSelected(index);
+    if (recordMode && playing) {
+      const grid = Math.max(1, Math.min(4, quantize));
+      const quantizedStep = ((Math.round(Math.max(0, currentStep) / grid) * grid) % 16);
+      updateCurrentPattern(pattern => pattern.map((row, padIndex) =>
+        padIndex === index ? row.map((active, stepIndex) => stepIndex === quantizedStep ? true : active) : row));
+    }
+    void playPad(index, velocity);
+  };
+
   const chooseFile = (index: number) => { setSelected(index); if (inputRef.current) { inputRef.current.value = ''; inputRef.current.click(); } };
   const removePad = (index: number) => {
-    const source = sourceRefs.current.get(index);
-    if (source) { try { source.stop(); } catch { /* already stopped */ } sourceRefs.current.delete(index); }
+    stopPad(index);
     setPads(old => old.map((pad, slot) => slot === index ? emptyPad() : pad));
-    setSteps(old => old.map((row, slot) => slot === index ? Array(16).fill(false) : row));
+    setPatterns(old => old.map(pattern => pattern.map((row, slot) => slot === index ? Array(16).fill(false) : row)));
     void removePersistedSample(index);
     setError('');
   };
 
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
+    const onKeyDown = (event: KeyboardEvent) => {
       if (event.repeat || event.ctrlKey || event.metaKey || event.altKey || /INPUT|TEXTAREA|SELECT/.test((event.target as HTMLElement)?.tagName ?? '')) return;
       const index = PAD_KEYS.indexOf(event.key.toUpperCase());
       if (index < 0) return;
       event.preventDefault();
-      setSelected(index);
-      void playPad(index);
+      handlePadHit(index, 0.88);
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [playPad]);
+    const onKeyUp = (event: KeyboardEvent) => {
+      const index = PAD_KEYS.indexOf(event.key.toUpperCase());
+      if (index >= 0) releasePad(index);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, [handlePadHit, releasePad]);
 
-  const toggleStep = (pad: number, step: number) => setSteps(old => old.map((row, i) => i === pad ? row.map((active, j) => j === step ? !active : active) : row));
-  const clearSequence = () => { setSteps(Array.from({ length: 16 }, () => Array(16).fill(false))); setCurrentStep(-1); };
+  const toggleStep = (pad: number, step: number) => updateCurrentPattern(pattern =>
+    pattern.map((row, rowIndex) => rowIndex === pad ? row.map((active, index) => index === step ? !active : active) : row));
+  const clearSequence = () => {
+    updateCurrentPattern(() => makeEmptyPattern());
+    setCurrentStep(-1);
+  };
 
   const exportMix = async () => {
     const audioPads = padsRef.current;
-    const pattern = stepsRef.current;
-    if (!audioPads.some((pad, index) => pad.buffer && pattern[index].some(Boolean))) {
-      setError('Add a sample and turn on at least one sequencer step before exporting a loop.');
+    const sequence = arrangementRef.current;
+    const hasHits = sequence.some(patternIndex => patternsRef.current[patternIndex]?.some(row => row.some(Boolean)));
+    if (!audioPads.some(pad => pad.buffer) || !hasHits) {
+      setError('Load a sample and add at least one sequencer hit before exporting.');
       return;
     }
     try {
-      const bpm = tempo;
+      const bpm = tempoRef.current;
       const stepSeconds = 60 / bpm / 4;
-      const length = Math.ceil(stepSeconds * 16 * 44100);
+      const songSeconds = stepSeconds * 16 * sequence.length;
+      const length = Math.ceil((songSeconds + 2) * 44100);
       const Offline = window.OfflineAudioContext || (window as typeof window & { webkitOfflineAudioContext?: typeof OfflineAudioContext }).webkitOfflineAudioContext;
       if (!Offline) throw new Error('WAV rendering is not supported by this browser.');
       const offline = new Offline(2, length, 44100);
       const masterGain = offline.createGain();
       masterGain.gain.value = masterValueRef.current;
       masterGain.connect(offline.destination);
+      const convolver = offline.createConvolver();
+      convolver.buffer = makeImpulse(offline, 1.2);
+      const reverbBus = offline.createGain();
+      reverbBus.gain.value = 0.32;
+      convolver.connect(reverbBus);
+      reverbBus.connect(masterGain);
+      const delayBus = offline.createGain();
+      const delay = offline.createDelay(1.5);
+      const feedback = offline.createGain();
+      delayBus.gain.value = effects.delay;
+      delay.delayTime.value = 0.28;
+      feedback.gain.value = 0.26;
+      delayBus.connect(delay);
+      delay.connect(feedback);
+      feedback.connect(delay);
+      delay.connect(masterGain);
+      const renderedPads = audioPads.map(pad => pad.buffer ? renderSample(offline, pad.buffer, pad) : null);
       audioPads.forEach((pad, padIndex) => {
-        if (!pad.buffer) return;
-        pattern[padIndex].forEach((active, stepIndex) => {
-          if (!active) return;
-          const source = offline.createBufferSource();
-          const gain = offline.createGain();
-          source.buffer = pad.buffer;
-          source.loop = pad.loop;
-          gain.gain.value = pad.volume;
-          source.connect(gain); gain.connect(masterGain);
-          const at = stepIndex * stepSeconds;
-          source.start(at);
-          if (pad.loop) source.stop(Math.min(length / 44100, at + stepSeconds));
+        const sample = renderedPads[padIndex];
+        if (!sample) return;
+        sequence.forEach((patternIndex, barIndex) => {
+          const pattern = patternsRef.current[patternIndex];
+          if (!pattern) return;
+          pattern[padIndex].forEach((active, stepIndex) => {
+            if (!active || Math.random() * 100 > pad.probability) return;
+            const swingOffset = stepIndex % 2 ? stepSeconds * swingRef.current * 0.45 : 0;
+            const baseTime = barIndex * stepSeconds * 16 + stepIndex * stepSeconds + swingOffset;
+            const ratchets = Math.max(1, Math.min(4, pad.ratchets));
+            for (let hit = 0; hit < ratchets; hit++) {
+              const source = offline.createBufferSource();
+              const gain = offline.createGain();
+              const filter = offline.createBiquadFilter();
+              source.buffer = sample;
+              source.loop = pad.loop || pad.triggerMode === 'gate';
+              filter.type = 'lowpass';
+              filter.frequency.value = pad.filterCutoff;
+              const voiceVolume = pad.volume * (hit > 0 ? 0.86 : 1);
+              const attack = pad.triggerMode === 'gate' ? pad.attack : pad.fadeIn;
+              const decay = Math.min(pad.decay, Math.max(0, stepSeconds - attack));
+              gain.gain.setValueAtTime(0, baseTime + (stepSeconds * hit) / ratchets);
+              gain.gain.linearRampToValueAtTime(voiceVolume, baseTime + (stepSeconds * hit) / ratchets + Math.max(0.001, attack));
+              gain.gain.linearRampToValueAtTime(voiceVolume * pad.sustain, baseTime + (stepSeconds * hit) / ratchets + attack + decay);
+              source.connect(filter);
+              let lastNode: AudioNode = filter;
+              if (pad.distortion > 0) {
+                const shaper = offline.createWaveShaper();
+                const curve = new Float32Array(1024);
+                const amount = 1 + pad.distortion * 75;
+                for (let point = 0; point < curve.length; point++) {
+                  const x = (point * 2) / (curve.length - 1) - 1;
+                  curve[point] = Math.tanh(x * amount) / Math.tanh(amount);
+                }
+                shaper.curve = curve;
+                shaper.oversample = '2x';
+                lastNode.connect(shaper);
+                lastNode = shaper;
+              }
+              lastNode.connect(gain);
+              gain.connect(masterGain);
+              gain.connect(convolver);
+              gain.connect(delayBus);
+              const at = baseTime + (stepSeconds * hit) / ratchets;
+              source.start(at);
+              if (source.loop) {
+                const releaseAt = at + stepSeconds / ratchets;
+                gain.gain.setValueAtTime(voiceVolume * pad.sustain, releaseAt);
+                gain.gain.linearRampToValueAtTime(0, releaseAt + pad.release);
+                source.stop(releaseAt + pad.release + 0.01);
+              }
+              if (pad.flam && hit === 0) {
+                const flamSource = offline.createBufferSource();
+                const flamGain = offline.createGain();
+                flamSource.buffer = sample;
+                flamGain.gain.value = pad.volume * 0.62;
+                flamSource.connect(flamGain);
+                flamGain.connect(masterGain);
+                flamSource.start(at + 0.028);
+              }
+            }
+          });
         });
       });
       const rendered = await offline.startRendering();
-      saveBlob(encodeWav(rendered), `padloop-${bpm}bpm-loop.wav`);
+      saveBlob(encodeWav(rendered), `padloop-${bpm}bpm-song.wav`);
       setError('');
-      setNotice('Loop mixdown downloaded as WAV');
+      setNotice('Arrangement mixdown downloaded as WAV');
       window.setTimeout(() => setNotice(''), 2600);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'The loop could not be rendered.');
     }
   };
 
-  const exportPad = (index: number) => {
+  const exportPad = async (index: number) => {
     const buffer = pads[index].buffer;
     if (!buffer) return;
-    saveBlob(encodeWav(buffer), `pad-${String(index + 1).padStart(2, '0')}-${pads[index].name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9-_]+/gi, '-')}.wav`);
+    const rendered = renderSample(context(), buffer, pads[index]);
+    saveBlob(encodeWav(rendered), `pad-${String(index + 1).padStart(2, '0')}-${pads[index].name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9-_]+/gi, '-')}.wav`);
     setNotice(`Pad ${String(index + 1).padStart(2, '0')} downloaded as WAV`);
     window.setTimeout(() => setNotice(''), 2600);
+  };
+
+  const exportMidi = () => {
+    const midi = buildMidiFile(tempo, patterns, arrangement, pads, swing);
+    saveBlob(midi, `padloop-${tempo}bpm-groove.mid`);
+    setNotice('MIDI arrangement exported');
+    window.setTimeout(() => setNotice(''), 2600);
+  };
+
+  const exportKitZip = async () => {
+    if (!pads.some(pad => pad.buffer)) { setError('Load at least one sample before exporting a kit.'); return; }
+    try {
+      const files: { name: string; data: Blob }[] = [];
+      for (let index = 0; index < pads.length; index++) {
+        const pad = pads[index];
+        if (!pad.buffer) continue;
+        const rendered = renderSample(context(), pad.buffer, pad);
+        const safeName = pad.name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9-_]+/gi, '-');
+        files.push({ name: `Samples/Pad-${String(index + 1).padStart(2, '0')}-${safeName}.wav`, data: encodeWav(rendered) });
+      }
+      const Offline = window.OfflineAudioContext || (window as typeof window & { webkitOfflineAudioContext?: typeof OfflineAudioContext }).webkitOfflineAudioContext;
+      if (!Offline) throw new Error('WAV stem rendering is not supported by this browser.');
+      const stepSeconds = 60 / tempo / 4;
+      const songSeconds = stepSeconds * 16 * arrangement.length;
+      for (let padIndex = 0; padIndex < pads.length; padIndex++) {
+        const pad = pads[padIndex];
+        if (!pad.buffer || !arrangement.some(patternIndex => patterns[patternIndex]?.[padIndex]?.some(Boolean))) continue;
+        const offline = new Offline(2, Math.ceil((songSeconds + 2) * 44100), 44100);
+        const stemGain = offline.createGain();
+        stemGain.connect(offline.destination);
+        const sample = renderSample(offline, pad.buffer, pad);
+        arrangement.forEach((patternIndex, barIndex) => {
+          const pattern = patterns[patternIndex];
+          if (!pattern) return;
+          pattern[padIndex].forEach((active, stepIndex) => {
+            if (!active || Math.random() * 100 > pad.probability) return;
+            const swingOffset = stepIndex % 2 ? stepSeconds * swing * 0.45 : 0;
+            const baseTime = barIndex * stepSeconds * 16 + stepIndex * stepSeconds + swingOffset;
+            const ratchets = Math.max(1, Math.min(4, pad.ratchets));
+            for (let hit = 0; hit < ratchets; hit++) {
+              const at = baseTime + (stepSeconds * hit) / ratchets;
+              const source = offline.createBufferSource();
+              const filter = offline.createBiquadFilter();
+              const gain = offline.createGain();
+              source.buffer = sample;
+              source.loop = pad.loop || pad.triggerMode === 'gate';
+              filter.type = 'lowpass';
+              filter.frequency.value = pad.filterCutoff;
+              gain.gain.value = pad.volume * (hit ? 0.86 : 1);
+              source.connect(filter);
+              let lastNode: AudioNode = filter;
+              if (pad.distortion > 0) {
+                const shaper = offline.createWaveShaper();
+                const curve = new Float32Array(1024);
+                const amount = 1 + pad.distortion * 75;
+                for (let point = 0; point < curve.length; point++) {
+                  const x = (point * 2) / (curve.length - 1) - 1;
+                  curve[point] = Math.tanh(x * amount) / Math.tanh(amount);
+                }
+                shaper.curve = curve;
+                shaper.oversample = '2x';
+                lastNode.connect(shaper);
+                lastNode = shaper;
+              }
+              lastNode.connect(gain);
+              gain.connect(stemGain);
+              source.start(at);
+              if (source.loop) {
+                source.stop(at + stepSeconds / ratchets + pad.release + 0.01);
+              }
+              if (pad.flam && hit === 0) {
+                const flam = offline.createBufferSource();
+                const flamGain = offline.createGain();
+                flam.buffer = sample;
+                flamGain.gain.value = pad.volume * 0.62;
+                flam.connect(flamGain);
+                flamGain.connect(stemGain);
+                flam.start(at + 0.028);
+              }
+            }
+          });
+        });
+        const stem = await offline.startRendering();
+        const safeName = pad.name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9-_]+/gi, '-');
+        files.push({ name: `Stems/Pad-${String(padIndex + 1).padStart(2, '0')}-${safeName}.wav`, data: encodeWav(stem) });
+      }
+      files.push({ name: 'Arrangement.mid', data: buildMidiFile(tempo, patterns, arrangement, pads, swing) });
+      files.push({
+        name: 'PadLoop-kit.json',
+        data: new Blob([JSON.stringify({ name: kitName, tempo, swing, quantize, patterns, arrangement, effects, pads: pads.map(({ buffer: _buffer, bars: _bars, ...settings }) => settings) }, null, 2)], { type: 'application/json' }),
+      });
+      const zip = await buildZip(files);
+      saveBlob(zip, `${kitName.trim().replace(/[^a-z0-9-_]+/gi, '-') || 'padloop-kit'}.zip`);
+      setError('');
+      setNotice('Kit ZIP exported with samples, sequencer stems, MIDI and settings');
+      window.setTimeout(() => setNotice(''), 3000);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'This kit could not be exported.');
+    }
   };
 
   const current = pads[selected];
@@ -581,7 +1300,18 @@ function App() {
                 key={index}
                 className={`pad ${pad.buffer ? 'loaded' : ''} ${selected === index ? 'selected' : ''} ${activePads.has(index) ? 'playing' : ''}`}
                 style={{ '--pad-color': padColors[index] } as CSSProperties & Record<string, string>}
-                onClick={() => { setSelected(index); if (pad.buffer) void playPad(index); }}
+                onPointerDown={event => {
+                  setSelected(index);
+                  const velocity = event.pointerType === 'pen' && event.pressure > 0 ? event.pressure : 0.88;
+                  pointerVelocityRef.current.set(index, velocity);
+                  if (pad.triggerMode === 'gate') handlePadHit(index, velocity);
+                }}
+                onPointerUp={() => releasePad(index)}
+                onPointerLeave={() => releasePad(index)}
+                onClick={() => {
+                  setSelected(index);
+                  if (pad.buffer && pad.triggerMode !== 'gate') handlePadHit(index, pointerVelocityRef.current.get(index) ?? 0.88);
+                }}
                 onDragOver={event => { event.preventDefault(); setSelected(index); setDragging(true); }}
                 onDragLeave={() => setDragging(false)}
                 onDrop={event => { event.preventDefault(); setDragging(false); const file = event.dataTransfer.files[0]; if (file) void importFile(file, index); }}
@@ -590,7 +1320,7 @@ function App() {
               >
                 <span className="pad-top"><span>{String(index + 1).padStart(2, '0')}</span><span className="pad-key">{PAD_KEYS[index]}</span></span>
                 {pad.name ? <span className="pad-name" data-testid={`text-pad-name-${index + 1}`}>{pad.name}</span> : <span className="pad-name pad-empty">Drop a sound</span>}
-                <span className="pad-meta"><span>{pad.buffer ? formatTime(pad.duration) : 'EMPTY SLOT'}</span><span>{pad.loop ? 'LOOP' : pad.buffer ? 'ONE SHOT' : '·'}</span></span>
+                <span className="pad-meta"><span>{pad.buffer ? formatTime(pad.duration) : 'EMPTY SLOT'}</span><span>{pad.triggerMode === 'gate' ? 'GATE' : pad.loop ? 'LOOP' : pad.buffer ? 'ONE SHOT' : '·'}</span></span>
                 {pad.buffer && <span className="wave" aria-label={`Waveform for ${pad.name}`} data-testid={`waveform-pad-${index + 1}`}>{pad.bars.map((height, bar) => <i key={bar} style={{ '--bar-height': `${height}%` } as CSSProperties & Record<string, string>} />)}</span>}
               </button>
             ))}
@@ -616,7 +1346,7 @@ function App() {
               data-testid="dropzone-sample"
             >
               {current.buffer ? (
-                <><div className="drop-icon"><AudioLines size={19} /></div><div className="sample-detail"><div className="sample-filename" data-testid="text-selected-sample">{current.name}</div><div className="sample-length" data-testid="text-sample-duration">{formatTime(current.duration)} · {current.buffer.numberOfChannels === 1 ? 'MONO' : 'STEREO'} · {Math.round(current.buffer.sampleRate / 1000)} kHz</div></div><button className="small-action" onClick={event => { event.stopPropagation(); void playPad(selected); }} data-testid="button-preview-sample"><Play size={13} /> Preview</button>{activePads.has(selected) && <button className="small-action" onClick={event => { event.stopPropagation(); const source = sourceRefs.current.get(selected); if (source) { try { source.stop(); } catch { /* already stopped */ } sourceRefs.current.delete(selected); } setActivePads(old => { const next = new Set(old); next.delete(selected); return next; }); }} data-testid="button-stop-sample"><Pause size={13} /> Stop</button>}</>
+                <><div className="drop-icon"><AudioLines size={19} /></div><div className="sample-detail"><div className="sample-filename" data-testid="text-selected-sample">{current.name}</div><div className="sample-length" data-testid="text-sample-duration">{formatTime(current.duration)} · {current.buffer.numberOfChannels === 1 ? 'MONO' : 'STEREO'} · {Math.round(current.buffer.sampleRate / 1000)} kHz</div></div><button className="small-action" onPointerDown={event => { event.stopPropagation(); if (current.triggerMode === 'gate') void playPad(selected); }} onPointerUp={event => { event.stopPropagation(); releasePad(selected); }} onPointerLeave={() => releasePad(selected)} onClick={event => { event.stopPropagation(); if (current.triggerMode !== 'gate') void playPad(selected); }} data-testid="button-preview-sample"><Play size={13} /> Preview</button>{activePads.has(selected) && <button className="small-action" onClick={event => { event.stopPropagation(); stopPad(selected); }} data-testid="button-stop-sample"><Pause size={13} /> Stop</button>}</>
               ) : (
                 <><div className="drop-icon"><Upload size={18} /></div><div className="drop-copy"><strong>Drop a sample here</strong><span>or click to browse · WAV, MP3, M4A, OGG, FLAC, AIFF</span></div><Plus size={16} color="#88918d" /></>
               )}
@@ -626,23 +1356,104 @@ function App() {
               <button className="small-action" onClick={() => exportPad(selected)} data-testid="button-export-selected-pad"><Download size={12} /> Download WAV</button>
             </div>}
             <div className="control-row">
-              <div className="volume-control"><Volume2 size={14} color="#969d9e" /><label htmlFor="pad-volume">PAD VOL</label><input id="pad-volume" type="range" min="0" max="1" step=".01" value={current.volume} onChange={event => setPads(old => old.map((pad, index) => index === selected ? { ...pad, volume: Number(event.target.value) } : pad))} data-testid="input-pad-volume" /></div>
-              <button className={`loop-toggle ${current.loop ? 'on' : ''}`} onClick={() => setPads(old => old.map((pad, index) => index === selected ? { ...pad, loop: !pad.loop } : pad))} data-testid="button-toggle-loop" aria-pressed={current.loop}><Repeat size={13} /> Loop {current.loop ? 'on' : 'off'}</button>
+              <div className="volume-control"><Volume2 size={14} color="#969d9e" /><label htmlFor="pad-volume">PAD VOL</label><input id="pad-volume" type="range" min="0" max="1" step=".01" value={current.volume} onChange={event => updatePad(selected, { volume: Number(event.target.value) })} data-testid="input-pad-volume" /></div>
+              <select aria-label="Pad playback mode" value={current.triggerMode} onChange={event => updatePad(selected, { triggerMode: event.target.value as Pad['triggerMode'] })} data-testid="select-trigger-mode">
+                <option value="one-shot">One-shot</option><option value="gate">Gate / hold</option>
+              </select>
+              <button className={`loop-toggle ${current.loop ? 'on' : ''}`} onClick={() => updatePad(selected, { loop: !current.loop })} data-testid="button-toggle-loop" aria-pressed={current.loop}><Repeat size={13} /> Loop {current.loop ? 'on' : 'off'}</button>
             </div>
+            <label className="checkline"><input type="checkbox" checked={current.velocitySensitive} onChange={event => updatePad(selected, { velocitySensitive: event.target.checked })} data-testid="toggle-velocity" /> Velocity-sensitive pads</label>
+            <details className="sampler-advanced">
+              <summary>Sample editor & sound shaping</summary>
+              <div className="editor-actions">
+                <button className="small-action" onClick={() => updatePad(selected, { reverse: !current.reverse })} disabled={!current.buffer} aria-pressed={current.reverse} data-testid="button-reverse-sample">{current.reverse ? 'Reverse on' : 'Reverse'}</button>
+                <button className="small-action" onClick={detectSelectedBpm} disabled={!current.buffer} data-testid="button-detect-bpm">Detect BPM</button>
+                <button className="small-action" onClick={() => void stretchSelectedToTempo()} disabled={!current.buffer} data-testid="button-stretch-tempo">Stretch to {tempo}</button>
+              </div>
+              {current.buffer && <div className="sample-length">Source BPM {current.detectedBpm ?? '—'} · {current.reverse ? 'REVERSED' : 'FORWARD'}</div>}
+              <div className="range-control">
+                <label htmlFor="trim-start">Trim start <span>{Math.round(current.trimStart * 100)}%</span></label>
+                <input id="trim-start" type="range" min="0" max={Math.max(0, current.trimEnd - 0.01)} step=".005" value={current.trimStart} disabled={!current.buffer} onChange={event => updatePad(selected, { trimStart: Math.min(Number(event.target.value), current.trimEnd - 0.01) })} data-testid="input-trim-start" />
+              </div>
+              <div className="range-control">
+                <label htmlFor="trim-end">Trim end <span>{Math.round(current.trimEnd * 100)}%</span></label>
+                <input id="trim-end" type="range" min={Math.min(1, current.trimStart + 0.01)} max="1" step=".005" value={current.trimEnd} disabled={!current.buffer} onChange={event => updatePad(selected, { trimEnd: Math.max(Number(event.target.value), current.trimStart + 0.01) })} data-testid="input-trim-end" />
+              </div>
+              <div className="editor-actions">
+                <label className="mini-select">Slice count
+                  <select value={sliceCount} onChange={event => setSliceCount(Number(event.target.value))} data-testid="select-slice-count">
+                    {[2, 4, 8, 16].map(count => <option key={count} value={count}>{count} slices</option>)}
+                  </select>
+                </label>
+                <button className="small-action" onClick={() => void sliceSelectedSample()} disabled={!current.buffer} data-testid="button-slice-sample">Slice across pads</button>
+              </div>
+              <div className="editor-grid">
+                <label>Pitch <span>{current.pitch > 0 ? '+' : ''}{current.pitch} st</span><input type="range" min="-12" max="12" step="1" value={current.pitch} onChange={event => updatePad(selected, { pitch: Number(event.target.value) })} data-testid="input-pitch" /></label>
+                <label>Filter <span>{current.filterCutoff >= 1000 ? `${(current.filterCutoff / 1000).toFixed(1)}k` : `${Math.round(current.filterCutoff)} Hz`}</span><input type="range" min="80" max="18000" step="20" value={current.filterCutoff} onChange={event => updatePad(selected, { filterCutoff: Number(event.target.value) })} data-testid="input-filter" /></label>
+                <label>Drive <span>{Math.round(current.distortion * 100)}%</span><input type="range" min="0" max="1" step=".01" value={current.distortion} onChange={event => updatePad(selected, { distortion: Number(event.target.value) })} data-testid="input-distortion" /></label>
+                <label>Fade in <span>{current.fadeIn.toFixed(2)}s</span><input type="range" min="0" max="1" step=".01" value={current.fadeIn} onChange={event => updatePad(selected, { fadeIn: Number(event.target.value) })} data-testid="input-fade-in" /></label>
+                <label>Fade out <span>{current.fadeOut.toFixed(2)}s</span><input type="range" min="0" max="1" step=".01" value={current.fadeOut} onChange={event => updatePad(selected, { fadeOut: Number(event.target.value) })} data-testid="input-fade-out" /></label>
+                <label>Attack <span>{current.attack.toFixed(2)}s</span><input type="range" min="0" max="1" step=".01" value={current.attack} onChange={event => updatePad(selected, { attack: Number(event.target.value) })} data-testid="input-envelope-attack" /></label>
+                <label>Decay <span>{current.decay.toFixed(2)}s</span><input type="range" min="0" max="1" step=".01" value={current.decay} onChange={event => updatePad(selected, { decay: Number(event.target.value) })} data-testid="input-envelope-decay" /></label>
+                <label>Sustain <span>{Math.round(current.sustain * 100)}%</span><input type="range" min="0" max="1" step=".01" value={current.sustain} onChange={event => updatePad(selected, { sustain: Number(event.target.value) })} data-testid="input-envelope-sustain" /></label>
+                <label>Release <span>{current.release.toFixed(2)}s</span><input type="range" min=".01" max="1" step=".01" value={current.release} onChange={event => updatePad(selected, { release: Number(event.target.value) })} data-testid="input-envelope-release" /></label>
+              </div>
+              <div className="editor-actions">
+                <label className="mini-select">Choke group
+                  <select value={current.chokeGroup} onChange={event => updatePad(selected, { chokeGroup: event.target.value })} data-testid="select-choke-group">
+                    <option value="">None</option><option value="A">A</option><option value="B">B</option>
+                  </select>
+                </label>
+                <label className="mini-select">Step chance
+                  <select value={current.probability} onChange={event => updatePad(selected, { probability: Number(event.target.value) })} data-testid="select-step-probability">
+                    {[100, 75, 50, 25].map(value => <option key={value} value={value}>{value}%</option>)}
+                  </select>
+                </label>
+                <label className="mini-select">Ratchets
+                  <select value={current.ratchets} onChange={event => updatePad(selected, { ratchets: Number(event.target.value) })} data-testid="select-ratchets">
+                    {[1, 2, 3, 4].map(value => <option key={value} value={value}>{value}×</option>)}
+                  </select>
+                </label>
+                <label className="checkline"><input type="checkbox" checked={current.flam} onChange={event => updatePad(selected, { flam: event.target.checked })} data-testid="toggle-flam" /> Flam</label>
+              </div>
+            </details>
             <div className="keyboard-hint" data-testid="text-keyboard-hint">KEY {PAD_KEYS[selected]} · {current.buffer ? 'Ready to play' : 'Slot ready for a sound'}</div>
           </div>
 
           <div className="panel sequencer-panel">
             <div className="panel-head">
               <div className="panel-heading"><span className="section-index">02 /</span><h2>16-step sequencer</h2></div>
-              <span className="hint" data-testid="status-sequencer">{playing ? 'PLAYING' : 'READY'}</span>
+              <span className="hint" data-testid="status-sequencer">{playing ? (songPlaying ? 'SONG PLAYING' : 'PATTERN PLAYING') : 'READY'}</span>
+            </div>
+            <div className="pattern-tabs" role="tablist" aria-label="Patterns">
+              {patterns.map((_, index) => <button key={index} className={currentPattern === index ? 'active' : ''} onClick={() => { setCurrentPattern(index); setCurrentStep(-1); }} role="tab" aria-selected={currentPattern === index} data-testid={`button-pattern-${index + 1}`}>Pattern {String.fromCharCode(65 + index)}</button>)}
             </div>
             <div className="seq-top">
               <label className="tempo-box">BPM <input type="number" min="50" max="180" value={tempo} onChange={event => setTempo(Math.max(50, Math.min(180, Number(event.target.value) || 50)))} data-testid="input-tempo" /></label>
               <div className="seq-actions">
-                <button className={`transport ${playing ? 'stop' : ''}`} onClick={() => playing ? stopSequence() : void startSequence()} data-testid="button-sequencer-transport">{playing ? <><Pause size={12} /> Stop</> : <><Play size={12} /> Play loop</>}</button>
+                <button className={`transport ${playing && !songPlaying ? 'stop' : ''}`} onClick={() => playing ? stopSequence() : void startSequence('pattern')} data-testid="button-sequencer-transport">{playing && !songPlaying ? <><Pause size={12} /> Stop</> : <><Play size={12} /> Play pattern</>}</button>
+                <button className={`transport ${songPlaying ? 'stop' : ''}`} onClick={() => songPlaying ? stopSequence() : void startSequence('song')} data-testid="button-play-arrangement">{songPlaying ? <><Pause size={12} /> Stop song</> : <><Play size={12} /> Play song</>}</button>
                 <button className="text-action" onClick={clearSequence} data-testid="button-clear-sequencer">Clear</button>
               </div>
+            </div>
+            <div className="groove-controls">
+              <label className="range-control">Swing <span>{Math.round(swing * 100)}%</span><input type="range" min="0" max=".6" step=".01" value={swing} onChange={event => setSwing(Number(event.target.value))} data-testid="input-swing" /></label>
+              <label className="mini-select">Record quantize
+                <select value={quantize} onChange={event => setQuantize(Number(event.target.value))} data-testid="select-quantize">
+                  <option value="1">1/16</option><option value="2">1/8</option><option value="4">1/4</option>
+                </select>
+              </label>
+              <button className={`small-action ${recordMode ? 'recording' : ''}`} onClick={() => setRecordMode(!recordMode)} aria-pressed={recordMode} data-testid="button-record-mode">{recordMode ? '● Recording' : '● Record pads'}</button>
+            </div>
+            <div className="arrangement-row" aria-label="Four-bar song arrangement">
+              <span className="arrangement-label">SONG</span>
+              {arrangement.map((patternIndex, barIndex) => (
+                <label key={barIndex}>Bar {barIndex + 1}
+                  <select value={patternIndex} onChange={event => setArrangement(old => old.map((value, index) => index === barIndex ? Number(event.target.value) : value))} data-testid={`select-arrangement-bar-${barIndex + 1}`}>
+                    {patterns.map((_, index) => <option key={index} value={index}>Pattern {String.fromCharCode(65 + index)}</option>)}
+                  </select>
+                </label>
+              ))}
             </div>
             <div className="step-scroll">
               <div className="step-header"><span></span>{Array.from({ length: 16 }, (_, i) => <span key={i}>{i % 4 === 0 ? String(i + 1).padStart(2, '0') : '·'}</span>)}</div>
@@ -664,6 +1475,28 @@ function App() {
           <div className="export-actions">
             <button className="export-button" onClick={() => void exportMix()} data-testid="button-export-loop"><Download size={14} /> Export loop mixdown <span className="hint">WAV</span></button>
             <button className="export-button" onClick={() => current.buffer ? exportPad(selected) : setError('Load a sound onto the selected pad to export its WAV.')} disabled={!current.buffer} data-testid="button-export-pad"><FileAudio2 size={14} /> Export selected pad <span className="hint">WAV</span></button>
+            <button className="export-button" onClick={exportMidi} data-testid="button-export-midi"><Download size={14} /> Export MIDI arrangement <span className="hint">MIDI</span></button>
+            <button className="export-button" onClick={() => void exportKitZip()} data-testid="button-export-kit-zip"><Download size={14} /> Export kit pack <span className="hint">ZIP</span></button>
+          </div>
+          <div className="kit-manager">
+            <div className="kit-manager-title">SAVE & RECALL KITS</div>
+            <div className="kit-controls">
+              <input aria-label="Kit name" value={kitName} onChange={event => setKitName(event.target.value)} placeholder="Kit name" data-testid="input-kit-name" />
+              <button className="small-action" onClick={() => void saveCurrentKit()} data-testid="button-save-kit">Save kit</button>
+            </div>
+            <div className="kit-controls">
+              <select aria-label="Saved kits" value={selectedKit} onChange={event => setSelectedKit(event.target.value)} data-testid="select-saved-kit">
+                <option value="">Choose a saved kit</option>
+                {savedKits.map(name => <option key={name} value={name}>{name}</option>)}
+              </select>
+              <button className="small-action" onClick={() => void loadSavedKit()} disabled={!selectedKit} data-testid="button-load-saved-kit">Load</button>
+              <button className="text-action" onClick={() => void removeSavedKit()} disabled={!selectedKit} data-testid="button-delete-saved-kit">Delete</button>
+            </div>
+          </div>
+          <div className="global-effects">
+            <div className="kit-manager-title">MASTER EFFECTS</div>
+            <label>Reverb <span>{Math.round(effects.reverb * 100)}%</span><input type="range" min="0" max=".8" step=".01" value={effects.reverb} onChange={event => setEffects(old => ({ ...old, reverb: Number(event.target.value) }))} data-testid="input-reverb" /></label>
+            <label>Delay <span>{Math.round(effects.delay * 100)}%</span><input type="range" min="0" max=".8" step=".01" value={effects.delay} onChange={event => setEffects(old => ({ ...old, delay: Number(event.target.value) }))} data-testid="input-delay" /></label>
           </div>
           <p className="export-caption" data-testid="text-export-guidance">Import these WAV files into FL Studio or Waveform. PadLoop is a browser sampler—not a VST or AU plugin.</p>
           {error && <div className="error-line" role="alert" data-testid="status-error">{error}</div>}
