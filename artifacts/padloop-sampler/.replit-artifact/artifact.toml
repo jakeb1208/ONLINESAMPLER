@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "PadLoop Sampler"
+description = "A browser-based 16-pad music sampler for loading sounds, playing and looping them, and exporting audio kits for use in FL Studio and Waveform."
+version = "1.0.0"
+id = "artifacts/padloop-sampler"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22326
+
+[services.development]
+run = "pnpm --filter @workspace/padloop-sampler run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/padloop-sampler", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/padloop-sampler/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22326"
+BASE_PATH = "/"
