@@ -3,6 +3,72 @@ import { Activity, AudioLines, Download, FileAudio2, Headphones, Pause, Play, Pl
 import { buildMidiFile, buildZip } from './lib/daw-export';
 import { detectBpm, makeImpulse, renderSample, reverseBuffer, sliceBuffer, stretchBuffer } from './lib/sampler-audio';
 
+type YouTubePlayer = {
+  getCurrentTime: () => number;
+  getDuration: () => number;
+  seekTo: (seconds: number, allowSeekAhead?: boolean) => void;
+  playVideo: () => void;
+  pauseVideo: () => void;
+  destroy: () => void;
+};
+
+type YouTubeApi = {
+  Player: new (
+    element: HTMLElement,
+    options: {
+      videoId: string;
+      playerVars?: Record<string, number | string>;
+      events?: {
+        onReady?: () => void;
+        onStateChange?: (event: { data: number }) => void;
+        onError?: () => void;
+      };
+    },
+  ) => YouTubePlayer;
+  PlayerState: { PLAYING: number };
+};
+
+declare global {
+  interface Window {
+    YT?: YouTubeApi;
+    onYouTubeIframeAPIReady?: () => void;
+  }
+}
+
+let youtubeApiPromise: Promise<void> | null = null;
+
+function loadYouTubeApi() {
+  if (window.YT?.Player) return Promise.resolve();
+  if (youtubeApiPromise) return youtubeApiPromise;
+  youtubeApiPromise = new Promise<void>((resolve, reject) => {
+    const previousCallback = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => {
+      previousCallback?.();
+      resolve();
+    };
+    const script = document.createElement('script');
+    script.src = 'https://www.youtube.com/iframe_api';
+    script.async = true;
+    script.onerror = () => reject(new Error('YouTube preview could not load. Check your connection or use a local video file.'));
+    document.head.appendChild(script);
+  });
+  return youtubeApiPromise;
+}
+
+function parseYouTubeId(value: string) {
+  try {
+    const url = new URL(value.trim());
+    const host = url.hostname.replace(/^www\./, '').toLowerCase();
+    if (host === 'youtu.be') return url.pathname.split('/').filter(Boolean)[0]?.match(/^[\w-]{11}$/)?.[0] ?? null;
+    if (!['youtube.com', 'm.youtube.com', 'youtube-nocookie.com'].includes(host)) return null;
+    const path = url.pathname.split('/').filter(Boolean);
+    const id = url.searchParams.get('v') ?? (['embed', 'shorts', 'live'].includes(path[0] ?? '') ? path[1] : null);
+    return id?.match(/^[\w-]{11}$/)?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
 type Pad = {
   name: string;
   duration: number;
@@ -370,6 +436,22 @@ function App() {
   const [savedKits, setSavedKits] = useState<string[]>([]);
   const [selectedKit, setSelectedKit] = useState('');
   const [sliceCount, setSliceCount] = useState(8);
+  const [youtubeUrl, setYoutubeUrl] = useState('');
+  const [youtubeId, setYoutubeId] = useState('');
+  const [youtubeReady, setYoutubeReady] = useState(false);
+  const [youtubeStart, setYoutubeStart] = useState(0);
+  const [youtubeEnd, setYoutubeEnd] = useState(5);
+  const [youtubeLoop, setYoutubeLoop] = useState(false);
+  const [youtubeMessage, setYoutubeMessage] = useState('');
+  const [localVideoUrl, setLocalVideoUrl] = useState('');
+  const [localVideoName, setLocalVideoName] = useState('');
+  const [localVideoDuration, setLocalVideoDuration] = useState(0);
+  const [clipStart, setClipStart] = useState(0);
+  const [clipEnd, setClipEnd] = useState(3);
+  const [localVideoLoop, setLocalVideoLoop] = useState(false);
+  const [videoBusy, setVideoBusy] = useState(false);
+  const [videoMessage, setVideoMessage] = useState('');
+  const [videoSliceCount, setVideoSliceCount] = useState(4);
   const audioRef = useRef<AudioContext | null>(null);
   const masterRef = useRef<GainNode | null>(null);
   const sourceRefs = useRef<Map<number, AudioBufferSourceNode>>(new Map());
@@ -383,6 +465,12 @@ function App() {
   const scheduledTimersRef = useRef<Set<number>>(new Set());
   const pointerVelocityRef = useRef<Map<number, number>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
+  const localVideoInputRef = useRef<HTMLInputElement>(null);
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const localVideoObjectUrlRef = useRef('');
+  const youtubePlayerRef = useRef<YouTubePlayer | null>(null);
+  const youtubePlayerHostRef = useRef<HTMLDivElement>(null);
+  const youtubeLoopTimerRef = useRef<number | null>(null);
   const timerRef = useRef<number | null>(null);
   const seqIndexRef = useRef(-1);
   const selectedRef = useRef(0);
@@ -400,6 +488,63 @@ function App() {
   selectedRef.current = selected; currentPatternRef.current = currentPattern;
   arrangementRef.current = arrangement; swingRef.current = swing; tempoRef.current = tempo;
   masterValueRef.current = master; effectsRef.current = effects;
+
+  useEffect(() => {
+    if (!youtubeId) return;
+    let disposed = false;
+    setYoutubeReady(false);
+    void loadYouTubeApi().then(() => {
+      const API = window.YT;
+      const host = youtubePlayerHostRef.current;
+      if (disposed || !API || !host) return;
+      youtubePlayerRef.current = new API.Player(host, {
+        videoId: youtubeId,
+        playerVars: { controls: 1, playsinline: 1, rel: 0, origin: window.location.origin },
+        events: {
+          onReady: () => {
+            if (disposed) return;
+            setYoutubeReady(true);
+            setYoutubeMessage('Preview ready · set start and end cues below');
+            const duration = youtubePlayerRef.current?.getDuration() ?? 0;
+            if (duration > 0) setYoutubeEnd(Math.min(5, duration));
+          },
+          onError: () => setYoutubeMessage('This video cannot be embedded. Try another link or load a local video file.'),
+        },
+      });
+    }).catch(reason => setYoutubeMessage(reason instanceof Error ? reason.message : 'YouTube preview could not load.'));
+    return () => {
+      disposed = true;
+      if (youtubeLoopTimerRef.current !== null) window.clearInterval(youtubeLoopTimerRef.current);
+      youtubeLoopTimerRef.current = null;
+      youtubePlayerRef.current?.destroy();
+      youtubePlayerRef.current = null;
+    };
+  }, [youtubeId]);
+
+  useEffect(() => {
+    if (!youtubeLoop || !youtubeReady) {
+      if (youtubeLoopTimerRef.current !== null) window.clearInterval(youtubeLoopTimerRef.current);
+      youtubeLoopTimerRef.current = null;
+      return;
+    }
+    youtubeLoopTimerRef.current = window.setInterval(() => {
+      const player = youtubePlayerRef.current;
+      if (player && player.getCurrentTime() >= youtubeEnd) {
+        player.seekTo(youtubeStart, true);
+        player.playVideo();
+      }
+    }, 120);
+    return () => {
+      if (youtubeLoopTimerRef.current !== null) window.clearInterval(youtubeLoopTimerRef.current);
+      youtubeLoopTimerRef.current = null;
+    };
+  }, [youtubeLoop, youtubeReady, youtubeStart, youtubeEnd]);
+
+  useEffect(() => () => {
+    if (localVideoObjectUrlRef.current) URL.revokeObjectURL(localVideoObjectUrlRef.current);
+    if (youtubeLoopTimerRef.current !== null) window.clearInterval(youtubeLoopTimerRef.current);
+    youtubePlayerRef.current?.destroy();
+  }, []);
 
   const context = useCallback(() => {
     if (!audioRef.current) {
@@ -1005,6 +1150,193 @@ function App() {
     void playPad(index, velocity);
   };
 
+  const loadYoutubePreview = () => {
+    const id = parseYouTubeId(youtubeUrl);
+    if (!id) {
+      setYoutubeMessage('Paste a valid YouTube watch, short, or embed link.');
+      return;
+    }
+    setYoutubeMessage('Loading YouTube preview…');
+    setYoutubeStart(0);
+    setYoutubeEnd(5);
+    setYoutubeLoop(false);
+    setYoutubeReady(false);
+    setYoutubeId(id);
+  };
+
+  const setYoutubeCue = (cue: 'start' | 'end') => {
+    const player = youtubePlayerRef.current;
+    if (!player) return;
+    const time = Math.max(0, player.getCurrentTime());
+    if (cue === 'start') {
+      setYoutubeStart(Math.min(time, Math.max(0, youtubeEnd - 0.05)));
+      setYoutubeMessage(`YouTube in point: ${time.toFixed(2)} seconds`);
+    } else {
+      setYoutubeEnd(Math.max(time, youtubeStart + 0.05));
+      setYoutubeMessage(`YouTube out point: ${time.toFixed(2)} seconds`);
+    }
+  };
+
+  const toggleYoutubeRange = () => {
+    const player = youtubePlayerRef.current;
+    if (!player || !youtubeReady) return;
+    if (youtubeLoop) {
+      setYoutubeLoop(false);
+      player.pauseVideo();
+      return;
+    }
+    if (youtubeEnd <= youtubeStart) {
+      setYoutubeMessage('Set the out point after the in point.');
+      return;
+    }
+    player.seekTo(youtubeStart, true);
+    player.playVideo();
+    setYoutubeLoop(true);
+  };
+
+  const chooseLocalVideo = (file: File) => {
+    if (!file.type.startsWith('video/') && !/\.(mp4|webm|mov|m4v|ogv|mkv)$/i.test(file.name)) {
+      setVideoMessage('Choose a video file such as MP4, WebM or MOV.');
+      return;
+    }
+    if (localVideoObjectUrlRef.current) URL.revokeObjectURL(localVideoObjectUrlRef.current);
+    const url = URL.createObjectURL(file);
+    localVideoObjectUrlRef.current = url;
+    setLocalVideoUrl(url);
+    setLocalVideoName(file.name);
+    setLocalVideoDuration(0);
+    setClipStart(0);
+    setClipEnd(3);
+    setLocalVideoLoop(false);
+    setVideoMessage('Video ready · the clipper processes this file in your browser.');
+  };
+
+  const captureLocalVideoAudio = async (start: number, end: number) => {
+    const video = localVideoRef.current;
+    if (!video) throw new Error('Load a local video file first.');
+    if (!(end > start)) throw new Error('The clip end must be later than its start.');
+    if (typeof MediaRecorder === 'undefined') throw new Error('Audio recording is not supported by this browser.');
+    const media = video as HTMLVideoElement & {
+      captureStream?: () => MediaStream;
+      mozCaptureStream?: () => MediaStream;
+    };
+    const capture = media.captureStream ?? media.mozCaptureStream;
+    if (!capture) throw new Error('This browser cannot capture audio from a local video. Try a current Chrome or Firefox browser.');
+    video.pause();
+    if (Math.abs(video.currentTime - start) > 0.01) {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(() => reject(new Error('The video could not seek to that clip point.')), 4000);
+        video.addEventListener('seeked', () => { window.clearTimeout(timeout); resolve(); }, { once: true });
+        video.currentTime = start;
+      });
+    }
+    const capturedStream = capture.call(video);
+    const audioTracks = capturedStream.getAudioTracks();
+    if (!audioTracks.length) {
+      capturedStream.getTracks().forEach(track => track.stop());
+      throw new Error('This video has no audio track to sample.');
+    }
+    const audioStream = new MediaStream(audioTracks);
+    const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
+      .find(type => MediaRecorder.isTypeSupported(type));
+    let recorder: MediaRecorder;
+    try {
+      recorder = mimeType ? new MediaRecorder(audioStream, { mimeType }) : new MediaRecorder(audioStream);
+    } catch {
+      capturedStream.getTracks().forEach(track => track.stop());
+      throw new Error('This browser cannot record the video’s audio format.');
+    }
+    const chunks: Blob[] = [];
+    const recording = new Promise<Blob>((resolve, reject) => {
+      let timer: number | null = null;
+      recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
+      recorder.onerror = () => {
+        if (timer !== null) window.clearInterval(timer);
+        reject(new Error('The video audio capture stopped unexpectedly.'));
+      };
+      recorder.onstop = () => {
+        if (timer !== null) window.clearInterval(timer);
+        capturedStream.getTracks().forEach(track => track.stop());
+        resolve(new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }));
+      };
+      recorder.start(100);
+      void video.play().catch(() => {
+        if (recorder.state === 'recording') recorder.stop();
+        reject(new Error('Press play on the local video once, then try capturing the clip again.'));
+      });
+      timer = window.setInterval(() => {
+        if (video.currentTime >= end || video.ended) {
+          video.pause();
+          if (timer !== null) window.clearInterval(timer);
+          if (recorder.state === 'recording') recorder.stop();
+        }
+      }, 20);
+    });
+    const audioBlob = await recording;
+    const audio = context();
+    if (audio.state !== 'running') await audio.resume();
+    return audio.decodeAudioData(await audioBlob.arrayBuffer());
+  };
+
+  const captureVideoClipToPad = async () => {
+    if (!localVideoUrl) return;
+    setVideoBusy(true);
+    setVideoMessage(`Capturing ${clipStart.toFixed(2)}–${clipEnd.toFixed(2)} seconds…`);
+    try {
+      const buffer = await captureLocalVideoAudio(clipStart, clipEnd);
+      const name = `${localVideoName.replace(/\.[^.]+$/, '')} ${clipStart.toFixed(2)}-${clipEnd.toFixed(2)}s.wav`;
+      const updated: Pad = { ...padsRef.current[selected], name, duration: buffer.duration, buffer, bars: makeWave(buffer), trimStart: 0, trimEnd: 1 };
+      const next = [...padsRef.current];
+      next[selected] = updated;
+      padsRef.current = next;
+      setPads(next);
+      setSelected(selected);
+      await persistSample(selected, new File([encodeWav(buffer)], name, { type: 'audio/wav' }));
+      setVideoMessage(`Clip added to pad ${String(selected + 1).padStart(2, '0')}.`);
+    } catch (reason) {
+      setVideoMessage(reason instanceof Error ? reason.message : 'This video clip could not be sampled.');
+    } finally {
+      setVideoBusy(false);
+    }
+  };
+
+  const sliceLocalVideoToPads = async () => {
+    if (!localVideoUrl) return;
+    const sliceDuration = (clipEnd - clipStart) / videoSliceCount;
+    if (sliceDuration < 0.06) { setVideoMessage('Choose a longer range to make these slices.'); return; }
+    const targets = Array.from({ length: videoSliceCount }, (_, index) => (selected + index) % 16);
+    if (targets.some(index => padsRef.current[index].buffer)
+      && !window.confirm(`Split this video range into ${videoSliceCount} pads? Loaded samples in those slots will be replaced.`)) return;
+    setVideoBusy(true);
+    const made: { index: number; buffer: AudioBuffer; name: string }[] = [];
+    try {
+      for (let part = 0; part < videoSliceCount; part++) {
+        const start = clipStart + sliceDuration * part;
+        const end = part === videoSliceCount - 1 ? clipEnd : start + sliceDuration;
+        setVideoMessage(`Capturing video slice ${part + 1} of ${videoSliceCount}…`);
+        const buffer = await captureLocalVideoAudio(start, end);
+        made.push({
+          index: targets[part],
+          buffer,
+          name: `${localVideoName.replace(/\.[^.]+$/, '')} slice ${String(part + 1).padStart(2, '0')}.wav`,
+        });
+      }
+      const next = [...padsRef.current];
+      made.forEach(({ index, buffer, name }) => {
+        next[index] = { ...emptyPad(), name, buffer, duration: buffer.duration, bars: makeWave(buffer) };
+      });
+      padsRef.current = next;
+      setPads(next);
+      await Promise.allSettled(made.map(({ index, buffer, name }) =>
+        persistSample(index, new File([encodeWav(buffer)], name, { type: 'audio/wav' }))));
+      setVideoMessage(`Created ${videoSliceCount} video slices on pads ${String(targets[0] + 1).padStart(2, '0')}–${String(targets[targets.length - 1] + 1).padStart(2, '0')}.`);
+    } catch (reason) {
+      setVideoMessage(reason instanceof Error ? reason.message : 'The video range could not be sliced.');
+    } finally {
+      setVideoBusy(false);
+    }
+  };
+
   const chooseFile = (index: number) => { setSelected(index); if (inputRef.current) { inputRef.current.value = ''; inputRef.current.click(); } };
   const removePad = (index: number) => {
     stopPad(index);
@@ -1269,7 +1601,7 @@ function App() {
           <div className="brand-mark"><Activity size={20} strokeWidth={2.5} /></div>
           <div><div className="brand-title">PadLoop</div><div className="brand-sub">Sampler · 01</div></div>
         </div>
-        <div className="local-pill" data-testid="status-local-only"><i className="local-dot" /> LOCAL ONLY <span>·</span> NO UPLOADS</div>
+        <div className="local-pill" data-testid="status-local-only"><i className="local-dot" /> SAMPLES STAY LOCAL <span>·</span> YOUTUBE PREVIEW</div>
       </header>
 
       <section className="intro">
@@ -1420,6 +1752,90 @@ function App() {
             <div className="keyboard-hint" data-testid="text-keyboard-hint">KEY {PAD_KEYS[selected]} · {current.buffer ? 'Ready to play' : 'Slot ready for a sound'}</div>
           </div>
 
+          <div className="panel video-tools-panel">
+            <div className="panel-head">
+              <div className="panel-heading"><span className="section-index">V /</span><h2>Video chop station</h2></div>
+              <span className="hint">PREVIEW + LOCAL CLIPS</span>
+            </div>
+            <div className="video-tools-body">
+              <div className="video-subhead">YouTube preview</div>
+              <div className="video-link-row">
+                <input
+                  type="url"
+                  value={youtubeUrl}
+                  onChange={event => setYoutubeUrl(event.target.value)}
+                  onKeyDown={event => { if (event.key === 'Enter') loadYoutubePreview(); }}
+                  placeholder="Paste a YouTube link"
+                  aria-label="YouTube video link"
+                  data-testid="input-youtube-link"
+                />
+                <button className="small-action" onClick={loadYoutubePreview} data-testid="button-load-youtube">Preview</button>
+              </div>
+              {youtubeId && <div className="youtube-player-frame"><div className="youtube-player-host" ref={youtubePlayerHostRef} /></div>}
+              {youtubeId && <div className="cue-controls">
+                <label>In <input type="number" min="0" step=".05" value={youtubeStart} onChange={event => setYoutubeStart(Math.max(0, Number(event.target.value) || 0))} data-testid="input-youtube-in" /></label>
+                <button className="small-action" onClick={() => setYoutubeCue('start')} disabled={!youtubeReady} data-testid="button-youtube-set-in">Set at playhead</button>
+                <label>Out <input type="number" min="0" step=".05" value={youtubeEnd} onChange={event => setYoutubeEnd(Math.max(youtubeStart + 0.05, Number(event.target.value) || 0))} data-testid="input-youtube-out" /></label>
+                <button className="small-action" onClick={() => setYoutubeCue('end')} disabled={!youtubeReady} data-testid="button-youtube-set-out">Set at playhead</button>
+                <button className="small-action" onClick={toggleYoutubeRange} disabled={!youtubeReady} data-testid="button-youtube-loop">{youtubeLoop ? 'Stop range' : 'Loop range'}</button>
+              </div>}
+              {youtubeMessage && <p className="video-message" role="status">{youtubeMessage}</p>}
+              <p className="video-legal-note">YouTube links play in YouTube’s embedded player; this app can’t extract or export their audio. Use a local video file you have rights to sample below.</p>
+
+              <div className="video-divider" />
+              <div className="video-subhead">Chop a local video into pads</div>
+              <button className="video-file-button" onClick={() => localVideoInputRef.current?.click()} data-testid="button-choose-video">
+                <Upload size={13} /> {localVideoName || 'Choose a video file'}
+              </button>
+              {localVideoUrl && <video
+                className="local-video-player"
+                ref={localVideoRef}
+                src={localVideoUrl}
+                controls
+                playsInline
+                onLoadedMetadata={event => {
+                  const duration = event.currentTarget.duration;
+                  setLocalVideoDuration(duration);
+                  setClipStart(0);
+                  setClipEnd(Math.min(3, duration));
+                  setVideoMessage(`Video ready · ${formatTime(duration)} · ${Math.round(event.currentTarget.videoWidth)}×${Math.round(event.currentTarget.videoHeight)}`);
+                }}
+                onTimeUpdate={event => {
+                  const video = event.currentTarget;
+                  if (localVideoLoop && video.currentTime >= clipEnd) {
+                    video.currentTime = clipStart;
+                    void video.play().catch(() => setLocalVideoLoop(false));
+                  }
+                }}
+                onError={() => setVideoMessage('This video format could not be opened by the browser. Try MP4 or WebM.')}
+                data-testid="video-local-source"
+              />}
+              {localVideoUrl && <div className="video-clip-controls">
+                <label>Start <input type="number" min="0" max={localVideoDuration || undefined} step=".01" value={clipStart} onChange={event => setClipStart(Math.min(localVideoDuration || 0, Math.max(0, Number(event.target.value) || 0)))} data-testid="input-video-start" /></label>
+                <button className="small-action" onClick={() => setClipStart(Math.max(0, Math.min(clipEnd - 0.05, localVideoRef.current?.currentTime ?? 0)))} data-testid="button-video-set-in">Set at playhead</button>
+                <label>End <input type="number" min="0.05" max={localVideoDuration || undefined} step=".01" value={clipEnd} onChange={event => setClipEnd(Math.max(clipStart + 0.05, Math.min(localVideoDuration || Infinity, Number(event.target.value) || 0.05)))} data-testid="input-video-end" /></label>
+                <button className="small-action" onClick={() => setClipEnd(Math.max(clipStart + 0.05, Math.min(localVideoDuration || Infinity, localVideoRef.current?.currentTime ?? clipEnd)))} data-testid="button-video-set-out">Set at playhead</button>
+                <button className="small-action" onClick={() => {
+                  const video = localVideoRef.current;
+                  if (!video) return;
+                  if (localVideoLoop) { setLocalVideoLoop(false); video.pause(); }
+                  else { video.currentTime = clipStart; setLocalVideoLoop(true); void video.play().catch(() => setLocalVideoLoop(false)); }
+                }} disabled={videoBusy} data-testid="button-video-loop">{localVideoLoop ? 'Stop range' : 'Loop range'}</button>
+                <div className="video-slice-row">
+                  <label>Split into
+                    <select value={videoSliceCount} onChange={event => setVideoSliceCount(Number(event.target.value))} data-testid="select-video-slices">
+                      {[2, 4, 8, 16].map(count => <option key={count} value={count}>{count} pads</option>)}
+                    </select>
+                  </label>
+                  <button className="small-action" onClick={() => void sliceLocalVideoToPads()} disabled={videoBusy || localVideoDuration <= 0} data-testid="button-video-slice">{videoBusy ? 'Capturing…' : 'Chop range to pads'}</button>
+                  <button className="small-action" onClick={() => void captureVideoClipToPad()} disabled={videoBusy || localVideoDuration <= 0} data-testid="button-video-add-clip">{videoBusy ? 'Capturing…' : `Add clip to pad ${selected + 1}`}</button>
+                </div>
+              </div>}
+              {videoMessage && <p className="video-message" role="status" data-testid="status-video-message">{videoMessage}</p>}
+              <p className="video-legal-note">Local video and extracted clips stay on this device. Clip audio is saved as WAV on the selected pads.</p>
+            </div>
+          </div>
+
           <div className="panel sequencer-panel">
             <div className="panel-head">
               <div className="panel-heading"><span className="section-index">02 /</span><h2>16-step sequencer</h2></div>
@@ -1503,11 +1919,12 @@ function App() {
         </div>
         <div className="panel guide-panel">
           <div className="bottom-title"><span className="section-index">i /</span><h2>Made for the session</h2></div>
-          <p className="guide-copy"><strong>Your files stay yours.</strong> Samples live in this browser tab and are saved locally on this device where browser storage allows. Nothing is sent anywhere. Start audio once, load a sound, tap pads or map a rhythm, then export a standard WAV.</p>
+          <p className="guide-copy"><strong>Your files stay yours.</strong> Samples and local video clips are processed and saved on this device where browser storage allows. YouTube previews load from YouTube; their audio cannot be extracted here. Export WAV or MIDI for FL Studio and Waveform.</p>
           <div className="volume-control" style={{ marginTop: 11 }}><Volume2 size={14} color="#969d9e" /><label htmlFor="master-volume">MASTER</label><input id="master-volume" type="range" min="0" max="1" step=".01" value={master} onChange={event => setMaster(Number(event.target.value))} data-testid="input-master-volume" /><span className="hint">{Math.round(master * 100)}%</span></div>
         </div>
       </section>
       <footer className="footer"><span>PADLOOP SAMPLER · 16 SLOTS · NO INSTALL</span><span>KEYBOARD: Q W E R / A S D F / Z X C V / 1 2 3 4</span></footer>
+      <input ref={localVideoInputRef} type="file" accept="video/*,.mp4,.webm,.mov,.m4v,.ogv,.mkv" hidden onChange={event => { const file = event.currentTarget.files?.[0]; if (file) chooseLocalVideo(file); }} data-testid="input-local-video-file" />
       <input ref={inputRef} type="file" accept="audio/*,.wav,.wave,.mp3,.m4a,.aac,.ogg,.oga,.flac,.aif,.aiff,.webm" hidden onChange={event => { const file = event.currentTarget.files?.[0]; if (file) void importFile(file, selectedRef.current); }} data-testid="input-sample-file" />
       {notice && <div className="notice" role="status" data-testid="status-notice">{notice}</div>}
     </main>
