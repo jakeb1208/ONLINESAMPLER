@@ -212,6 +212,9 @@ select:focus-visible,input[type=text]:focus-visible { outline:2px solid #56dc9f;
 .cue-controls input,.video-clip-controls input { width:82px;min-width:0;padding:5px 6px;font-size:10px; }
 .cue-controls .small-action { justify-self:start; }
 .cue-controls button:last-child { grid-column:1/-1; }
+.youtube-pad-action { display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:9px; }
+.youtube-pad-action .small-action { flex:0 0 auto; }
+.youtube-pad-action span { color:#828b8b;font-size:9px;line-height:1.5; }
 .video-message { color:#8edbb0;font-size:10px;line-height:1.5;margin:8px 0 0; }
 .video-legal-note { color:#828b8b;font-size:9px;line-height:1.5;margin:9px 0 0; }
 .video-divider { height:1px;background:#343a40;margin:14px 0; }

@@ -1290,13 +1290,21 @@ function App() {
     return audio.decodeAudioData(await audioBlob.arrayBuffer());
   };
 
-  const captureVideoClipToPad = async () => {
+  const captureVideoClipToPad = async (
+    start = clipStart,
+    end = clipEnd,
+    matchYoutubeCue = false,
+  ) => {
     if (!localVideoUrl) return;
+    if (start < 0 || end <= start || end > localVideoDuration) {
+      setVideoMessage('The selected cue range must fit inside the loaded local video.');
+      return;
+    }
     setVideoBusy(true);
-    setVideoMessage(`Capturing ${clipStart.toFixed(2)}–${clipEnd.toFixed(2)} seconds…`);
+    setVideoMessage(`${matchYoutubeCue ? 'Capturing matching local-video cue' : 'Capturing'} ${start.toFixed(2)}–${end.toFixed(2)} seconds…`);
     try {
-      const buffer = await captureLocalVideoAudio(clipStart, clipEnd);
-      const name = `${localVideoName.replace(/\.[^.]+$/, '')} ${clipStart.toFixed(2)}-${clipEnd.toFixed(2)}s.wav`;
+      const buffer = await captureLocalVideoAudio(start, end);
+      const name = `${localVideoName.replace(/\.[^.]+$/, '')}${matchYoutubeCue ? ' reference cue' : ''} ${start.toFixed(2)}-${end.toFixed(2)}s.wav`;
       const updated: Pad = { ...padsRef.current[selected], name, duration: buffer.duration, buffer, bars: makeWave(buffer), trimStart: 0, trimEnd: 1 };
       const next = [...padsRef.current];
       next[selected] = updated;
@@ -1304,7 +1312,7 @@ function App() {
       setPads(next);
       setSelected(selected);
       await persistSample(selected, new File([encodeWav(buffer)], name, { type: 'audio/wav' }));
-      setVideoMessage(`Clip added to pad ${String(selected + 1).padStart(2, '0')}.`);
+      setVideoMessage(`${matchYoutubeCue ? 'Matching local-video cue' : 'Clip'} added to pad ${String(selected + 1).padStart(2, '0')}.`);
     } catch (reason) {
       setVideoMessage(reason instanceof Error ? reason.message : 'This video clip could not be sampled.');
     } finally {
@@ -1791,8 +1799,19 @@ function App() {
                 <button className="small-action" onClick={() => setYoutubeCue('end')} disabled={!youtubeReady} data-testid="button-youtube-set-out">Set at playhead</button>
                 <button className="small-action" onClick={toggleYoutubeRange} disabled={!youtubeReady} data-testid="button-youtube-loop">{youtubeLoop ? 'Stop range' : 'Loop range'}</button>
               </div>}
+              {youtubeId && <div className="youtube-pad-action">
+                <button
+                  className="small-action"
+                  onClick={() => void captureVideoClipToPad(youtubeStart, youtubeEnd, true)}
+                  disabled={!youtubeReady || !localVideoUrl || localVideoDuration < youtubeEnd || videoBusy}
+                  data-testid="button-youtube-cue-to-pad"
+                >
+                  {videoBusy ? 'Capturing…' : `Add local cue to pad ${selected + 1}`}
+                </button>
+                <span>{!localVideoUrl ? 'Choose a matching local video below to enable.' : localVideoDuration < youtubeEnd ? 'The local video must be at least as long as the cue.' : 'Uses the matching time range from your local video, not YouTube audio.'}</span>
+              </div>}
               {youtubeMessage && <p className="video-message" role="status">{youtubeMessage}</p>}
-              <p className="video-legal-note">YouTube links play in YouTube’s embedded player; this app can’t extract or export their audio. Use a local video file you have rights to sample below.</p>
+              <p className="video-legal-note">YouTube links play in YouTube’s embedded player; this app can’t extract or export their audio. Load a matching local video file you have rights to sample below to put its cue range on a pad.</p>
 
               <div className="video-divider" />
               <div className="video-subhead">Chop a local video into pads</div>
