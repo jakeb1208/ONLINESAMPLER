@@ -705,13 +705,12 @@ function App() {
         });
       }
       const previous = sourceRefs.current.get(index);
-      if (isLooping) {
-        const previousVoices = voiceSourcesRef.current.get(index);
-        if (previousVoices?.size) previousVoices.forEach(voice => { try { voice.stop(); } catch { /* already stopped */ } });
-        else if (previous) { try { previous.stop(); } catch { /* already stopped */ } }
-        voiceSourcesRef.current.delete(index);
-        sourceRefs.current.delete(index);
-      }
+      const previousVoices = voiceSourcesRef.current.get(index);
+      if (previousVoices?.size) previousVoices.forEach(voice => { try { voice.stop(); } catch { /* already stopped */ } });
+      else if (previous) { try { previous.stop(); } catch { /* already stopped */ } }
+      voiceSourcesRef.current.delete(index);
+      sourceRefs.current.delete(index);
+      voiceGainRefs.current.delete(index);
 
       let sample = pad.buffer;
       if (pad.reverse) {
