@@ -1,1 +1,2 @@
 - [YouTube cue playback](youtube-cue-playback.md) — Keep link cues browser-streamed in the visible player; they are not extractable sampler/export audio.
+- [Mobile pad audio](mobile-pad-audio.md) — Trigger audio pads in the touch pointer-down gesture; keep keyboard/click fallback from double-playing.
