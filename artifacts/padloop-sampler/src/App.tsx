@@ -6,6 +6,7 @@ import { detectBpm, makeImpulse, renderSample, reverseBuffer, sliceBuffer, stret
 type YouTubePlayer = {
   getCurrentTime: () => number;
   getDuration: () => number;
+  getVideoUrl: () => string;
   getPlayerState: () => number;
   seekTo: (seconds: number, allowSeekAhead?: boolean) => void;
   playVideo: () => void;
@@ -456,7 +457,12 @@ function saveBlob(blob: Blob, name: string) {
 }
 
 function App() {
-  const [pads, setPads] = useState<Pad[]>(makePads);
+  const [initialYoutubeCues] = useState(readYoutubePadCues);
+  const initialYoutubeCue = initialYoutubeCues.find((cue): cue is YouTubeCue => cue !== null) ?? null;
+  const [pads, setPads] = useState<Pad[]>(() => makePads().map((pad, index) => ({
+    ...pad,
+    ...(initialYoutubeCues[index] ? { youtubeCue: initialYoutubeCues[index]! } : {}),
+  })));
   const [patterns, setPatterns] = useState<boolean[][][]>(() => Array.from({ length: 4 }, makeEmptyPattern));
   const [currentPattern, setCurrentPattern] = useState(0);
   const [arrangement, setArrangement] = useState([0, 1, 0, 1]);
@@ -479,11 +485,12 @@ function App() {
   const [savedKits, setSavedKits] = useState<string[]>([]);
   const [selectedKit, setSelectedKit] = useState('');
   const [sliceCount, setSliceCount] = useState(8);
-  const [youtubeUrl, setYoutubeUrl] = useState('');
-  const [youtubeId, setYoutubeId] = useState('');
+  const [youtubeUrl, setYoutubeUrl] = useState(initialYoutubeCue?.url ?? '');
+  const [youtubeId, setYoutubeId] = useState(initialYoutubeCue?.videoId ?? '');
+  const [youtubePlayerVersion, setYoutubePlayerVersion] = useState(0);
   const [youtubeReady, setYoutubeReady] = useState(false);
-  const [youtubeStart, setYoutubeStart] = useState(0);
-  const [youtubeEnd, setYoutubeEnd] = useState(5);
+  const [youtubeStart, setYoutubeStart] = useState(initialYoutubeCue?.start ?? 0);
+  const [youtubeEnd, setYoutubeEnd] = useState(initialYoutubeCue?.end ?? 5);
   const [youtubeLoop, setYoutubeLoop] = useState(false);
   const [youtubeMessage, setYoutubeMessage] = useState('');
   const [localVideoUrl, setLocalVideoUrl] = useState('');
@@ -514,6 +521,10 @@ function App() {
   const youtubePlayerRef = useRef<YouTubePlayer | null>(null);
   const youtubePlayerHostRef = useRef<HTMLDivElement>(null);
   const youtubeLoopTimerRef = useRef<number | null>(null);
+  const youtubePadTimerRef = useRef<number | null>(null);
+  const youtubeActivePadRef = useRef<number | null>(null);
+  const youtubePendingPadCueRef = useRef<{ index: number; cue: YouTubeCue; velocity: number; gateDuration?: number } | null>(null);
+  const youtubeActiveVideoIdRef = useRef(youtubeId);
   const timerRef = useRef<number | null>(null);
   const seqIndexRef = useRef(-1);
   const selectedRef = useRef(0);
@@ -532,6 +543,82 @@ function App() {
   arrangementRef.current = arrangement; swingRef.current = swing; tempoRef.current = tempo;
   masterValueRef.current = master; effectsRef.current = effects;
 
+  const clearYoutubePadPlayback = useCallback((pausePlayer = true) => {
+    if (youtubePadTimerRef.current !== null) window.clearInterval(youtubePadTimerRef.current);
+    youtubePadTimerRef.current = null;
+    const previousPad = youtubeActivePadRef.current;
+    youtubeActivePadRef.current = null;
+    if (pausePlayer) youtubePlayerRef.current?.pauseVideo();
+    if (previousPad !== null && !voiceSourcesRef.current.get(previousPad)?.size) {
+      setActivePads(old => { const next = new Set(old); next.delete(previousPad); return next; });
+    }
+  }, []);
+
+  const startYoutubePadPlayback = useCallback((
+    index: number,
+    cue: YouTubeCue,
+    player: YouTubePlayer,
+    velocity = 1,
+    gateDuration?: number,
+  ) => {
+    const pad = padsRef.current[index];
+    if (!pad) return;
+    clearYoutubePadPlayback(true);
+    const end = gateDuration === undefined ? cue.end : Math.min(cue.end, cue.start + gateDuration);
+    const shouldLoop = gateDuration === undefined && (pad.loop || pad.triggerMode === 'gate');
+    if (end <= cue.start) return;
+    const velocityGain = pad.velocitySensitive ? Math.max(0.08, Math.min(1, velocity)) : 1;
+    player.setVolume(Math.round(Math.max(0, Math.min(1, pad.volume * velocityGain)) * 100));
+    youtubeActivePadRef.current = index;
+    youtubeActiveVideoIdRef.current = cue.videoId;
+    setActivePads(old => new Set(old).add(index));
+    player.loadVideoById({ videoId: cue.videoId, startSeconds: cue.start, endSeconds: end });
+    const startedAt = performance.now();
+    youtubePadTimerRef.current = window.setInterval(() => {
+      const state = player.getPlayerState();
+      const currentTime = player.getCurrentTime();
+      const playbackEnded = state === window.YT?.PlayerState.ENDED;
+      const reachedEnd = state === window.YT?.PlayerState.PLAYING && currentTime >= end - 0.04;
+      if (performance.now() - startedAt < 350 || (!playbackEnded && !reachedEnd)) return;
+      if (shouldLoop) {
+        player.seekTo(cue.start, true);
+        player.playVideo();
+      } else {
+        clearYoutubePadPlayback(state === window.YT?.PlayerState.PLAYING);
+      }
+    }, 40);
+  }, [clearYoutubePadPlayback]);
+
+  const chokeSiblingPads = useCallback((index: number, group: string) => {
+    if (!group) return;
+    const chokedPads: number[] = [];
+    sourceRefs.current.forEach((activeSource, activeIndex) => {
+      if (activeIndex !== index && padsRef.current[activeIndex]?.chokeGroup === group) {
+        const voices = voiceSourcesRef.current.get(activeIndex);
+        if (voices?.size) voices.forEach(voice => { try { voice.stop(); } catch { /* already stopped */ } });
+        else { try { activeSource.stop(); } catch { /* already stopped */ } }
+        sourceRefs.current.delete(activeIndex);
+        voiceSourcesRef.current.delete(activeIndex);
+        voiceGainRefs.current.delete(activeIndex);
+        chokedPads.push(activeIndex);
+      }
+    });
+    const activeYoutubePad = youtubeActivePadRef.current;
+    if (activeYoutubePad !== null && activeYoutubePad !== index && padsRef.current[activeYoutubePad]?.chokeGroup === group) {
+      clearYoutubePadPlayback(true);
+    }
+    if (chokedPads.length) setActivePads(old => {
+      const next = new Set(old);
+      chokedPads.forEach(activeIndex => next.delete(activeIndex));
+      return next;
+    });
+  }, [clearYoutubePadPlayback]);
+
+  const youtubeCueStorageValue = JSON.stringify(pads.map(pad => pad.youtubeCue ?? null));
+  useEffect(() => {
+    try { localStorage.setItem(YOUTUBE_CUES_STORAGE_KEY, youtubeCueStorageValue); } catch { /* Cues also persist when saved inside a kit. */ }
+  }, [youtubeCueStorageValue]);
+
   useEffect(() => {
     if (!youtubeId) return;
     let disposed = false;
@@ -547,11 +634,37 @@ function App() {
           onReady: () => {
             if (disposed) return;
             setYoutubeReady(true);
+            youtubeActiveVideoIdRef.current = youtubeId;
+            const pending = youtubePendingPadCueRef.current;
+            if (pending) {
+              youtubePendingPadCueRef.current = null;
+              const player = youtubePlayerRef.current;
+              if (!player) {
+                setYoutubeMessage('YouTube player is not ready yet. Tap the pad again.');
+                return;
+              }
+              setYoutubeUrl(pending.cue.url);
+              setYoutubeStart(pending.cue.start);
+              setYoutubeEnd(pending.cue.end);
+              setYoutubeMessage(`Playing YouTube cue on pad ${pending.index + 1}.`);
+              startYoutubePadPlayback(pending.index, pending.cue, player, pending.velocity, pending.gateDuration);
+              return;
+            }
             setYoutubeMessage('Preview ready · set start and end cues below');
-            const duration = youtubePlayerRef.current?.getDuration() ?? 0;
-            if (duration > 0) setYoutubeEnd(Math.min(5, duration));
+            const assignedCue = padsRef.current.find(pad => pad.youtubeCue?.videoId === youtubeId)?.youtubeCue;
+            if (assignedCue) {
+              setYoutubeStart(assignedCue.start);
+              setYoutubeEnd(assignedCue.end);
+            } else {
+              const duration = youtubePlayerRef.current?.getDuration() ?? 0;
+              if (duration > 0) setYoutubeEnd(Math.min(5, duration));
+            }
           },
-          onError: () => setYoutubeMessage('This video cannot be embedded. Try another link or load a local video file.'),
+          onError: () => {
+            setYoutubeMessage('This video cannot be embedded. Try another link.');
+            youtubePendingPadCueRef.current = null;
+            clearYoutubePadPlayback(false);
+          },
         },
       });
     }).catch(reason => setYoutubeMessage(reason instanceof Error ? reason.message : 'YouTube preview could not load.'));
@@ -559,10 +672,11 @@ function App() {
       disposed = true;
       if (youtubeLoopTimerRef.current !== null) window.clearInterval(youtubeLoopTimerRef.current);
       youtubeLoopTimerRef.current = null;
+      clearYoutubePadPlayback(false);
       youtubePlayerRef.current?.destroy();
       youtubePlayerRef.current = null;
     };
-  }, [youtubeId]);
+  }, [youtubeId, youtubePlayerVersion, clearYoutubePadPlayback, startYoutubePadPlayback]);
 
   useEffect(() => {
     if (!youtubeLoop || !youtubeReady) {
@@ -586,6 +700,7 @@ function App() {
   useEffect(() => () => {
     if (localVideoObjectUrlRef.current) URL.revokeObjectURL(localVideoObjectUrlRef.current);
     if (youtubeLoopTimerRef.current !== null) window.clearInterval(youtubeLoopTimerRef.current);
+    if (youtubePadTimerRef.current !== null) window.clearInterval(youtubePadTimerRef.current);
     youtubePlayerRef.current?.destroy();
   }, []);
 
@@ -664,7 +779,7 @@ function App() {
   }, [context]);
 
   const loadBouncyPreset = useCallback(async () => {
-    const hadLoadedSamples = padsRef.current.some(pad => pad.buffer);
+    const hadLoadedSamples = padsRef.current.some(pad => pad.buffer || pad.youtubeCue);
     if (hadLoadedSamples && !window.confirm('Load Bouncy 808? This replaces the current 16 pads and step pattern.')) return;
     await unlockAudio();
     const audio = audioRef.current;
@@ -682,6 +797,7 @@ function App() {
       setSongPlaying(false);
       setCurrentStep(-1);
       seqIndexRef.current = -1;
+      clearYoutubePadPlayback(true);
       voiceSourcesRef.current.forEach(voices => voices.forEach(source => { try { source.stop(); } catch { /* already stopped */ } }));
       voiceSourcesRef.current.clear();
       sourceRefs.current.forEach(source => { try { source.stop(); } catch { /* already stopped */ } });
@@ -713,37 +829,56 @@ function App() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'The Bouncy 808 preset could not be loaded.');
     }
-  }, [unlockAudio]);
+  }, [unlockAudio, clearYoutubePadPlayback]);
 
   const playPad = useCallback(async (index: number, velocity = 1, gateDuration?: number) => {
     const pad = padsRef.current[index];
+    if (pad?.youtubeCue) {
+      setSelected(index);
+      try {
+        if (youtubeLoopTimerRef.current !== null) window.clearInterval(youtubeLoopTimerRef.current);
+        youtubeLoopTimerRef.current = null;
+        setYoutubeLoop(false);
+        chokeSiblingPads(index, pad.chokeGroup);
+        const previousVoices = voiceSourcesRef.current.get(index);
+        if (previousVoices?.size) previousVoices.forEach(voice => { try { voice.stop(); } catch { /* already stopped */ } });
+        else {
+          const previous = sourceRefs.current.get(index);
+          if (previous) { try { previous.stop(); } catch { /* already stopped */ } }
+        }
+        voiceSourcesRef.current.delete(index);
+        sourceRefs.current.delete(index);
+        voiceGainRefs.current.delete(index);
+        setYoutubeUrl(pad.youtubeCue.url);
+        setYoutubeStart(pad.youtubeCue.start);
+        setYoutubeEnd(pad.youtubeCue.end);
+        const player = youtubePlayerRef.current;
+        if (youtubeReady && player) {
+          startYoutubePadPlayback(index, pad.youtubeCue, player, velocity, gateDuration);
+          setYoutubeMessage(`Playing YouTube cue on pad ${index + 1}.`);
+        } else {
+          clearYoutubePadPlayback(true);
+          youtubePendingPadCueRef.current = { index, cue: pad.youtubeCue, velocity, gateDuration };
+          if (youtubeId !== pad.youtubeCue.videoId) setYoutubeId(pad.youtubeCue.videoId);
+          else setYoutubePlayerVersion(value => value + 1);
+          setYoutubeMessage('Loading the YouTube player…');
+        }
+      } catch (reason) {
+        clearYoutubePadPlayback(false);
+        setYoutubeMessage(reason instanceof Error ? reason.message : 'This YouTube cue could not be played.');
+      }
+      return;
+    }
     if (!pad?.buffer) {
       setSelected(index);
       return;
     }
     try {
+      if (youtubeActivePadRef.current === index) clearYoutubePadPlayback(true);
       const audio = context();
       if (audio.state !== 'running') await audio.resume();
       const isLooping = pad.loop || pad.triggerMode === 'gate';
-      if (pad.chokeGroup) {
-        const chokedPads: number[] = [];
-        sourceRefs.current.forEach((activeSource, activeIndex) => {
-          if (activeIndex !== index && padsRef.current[activeIndex]?.chokeGroup === pad.chokeGroup) {
-            const voices = voiceSourcesRef.current.get(activeIndex);
-            if (voices?.size) voices.forEach(voice => { try { voice.stop(); } catch { /* already stopped */ } });
-            else { try { activeSource.stop(); } catch { /* already stopped */ } }
-            sourceRefs.current.delete(activeIndex);
-            voiceSourcesRef.current.delete(activeIndex);
-            voiceGainRefs.current.delete(activeIndex);
-            chokedPads.push(activeIndex);
-          }
-        });
-        if (chokedPads.length) setActivePads(old => {
-          const next = new Set(old);
-          chokedPads.forEach(activeIndex => next.delete(activeIndex));
-          return next;
-        });
-      }
+      chokeSiblingPads(index, pad.chokeGroup);
       const previous = sourceRefs.current.get(index);
       const previousVoices = voiceSourcesRef.current.get(index);
       if (previousVoices?.size) previousVoices.forEach(voice => { try { voice.stop(); } catch { /* already stopped */ } });
@@ -827,7 +962,7 @@ function App() {
           if (latest) sourceRefs.current.set(index, latest);
           else sourceRefs.current.delete(index);
         }
-        if (!activeVoices?.size) {
+        if (!activeVoices?.size && youtubeActivePadRef.current !== index) {
           voiceSourcesRef.current.delete(index);
           voiceGainRefs.current.delete(index);
           setActivePads(old => { const next = new Set(old); next.delete(index); return next; });
@@ -847,10 +982,18 @@ function App() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'This sound could not be played.');
     }
-  }, [context]);
+  }, [context, clearYoutubePadPlayback, startYoutubePadPlayback, chokeSiblingPads, youtubeId, youtubeReady]);
 
   const releasePad = useCallback((index: number) => {
     const pad = padsRef.current[index];
+    if (pad?.triggerMode === 'gate' && youtubePendingPadCueRef.current?.index === index) {
+      youtubePendingPadCueRef.current = null;
+      return;
+    }
+    if (pad?.triggerMode === 'gate' && youtubeActivePadRef.current === index) {
+      clearYoutubePadPlayback(true);
+      return;
+    }
     if (pad?.triggerMode !== 'gate') return;
     const audio = audioRef.current;
     const source = sourceRefs.current.get(index);
@@ -860,9 +1003,11 @@ function App() {
     gain.gain.cancelScheduledValues(audio.currentTime);
     gain.gain.setTargetAtTime(0, audio.currentTime, Math.max(0.008, pad.release / 4));
     try { source.stop(stopAt + 0.02); } catch { /* already stopped */ }
-  }, []);
+  }, [clearYoutubePadPlayback]);
 
   const stopPad = useCallback((index: number) => {
+    if (youtubePendingPadCueRef.current?.index === index) youtubePendingPadCueRef.current = null;
+    if (youtubeActivePadRef.current === index) clearYoutubePadPlayback(true);
     const voices = voiceSourcesRef.current.get(index);
     if (voices?.size) voices.forEach(source => { try { source.stop(); } catch { /* already stopped */ } });
     else {
@@ -873,7 +1018,7 @@ function App() {
     sourceRefs.current.delete(index);
     voiceGainRefs.current.delete(index);
     setActivePads(old => { const next = new Set(old); next.delete(index); return next; });
-  }, []);
+  }, [clearYoutubePadPlayback]);
 
   const updatePad = (index: number, changes: Partial<Pad>) => {
     setPads(old => old.map((pad, slot) => slot === index ? { ...pad, ...changes } : pad));
@@ -913,7 +1058,7 @@ function App() {
 
   const loadSavedKit = async () => {
     if (!selectedKit) return;
-    if (padsRef.current.some(pad => pad.buffer) && !window.confirm(`Load “${selectedKit}”? This replaces the current pads and session settings.`)) return;
+    if (padsRef.current.some(pad => pad.buffer || pad.youtubeCue) && !window.confirm(`Load “${selectedKit}”? This replaces the current pads and session settings.`)) return;
     await unlockAudio();
     const audio = audioRef.current;
     if (!audio || audio.state !== 'running') return;
@@ -925,6 +1070,7 @@ function App() {
         return { ...emptyPad(), ...settings, buffer, duration: buffer?.duration ?? 0, bars: buffer ? makeWave(buffer) : [] };
       }));
       stopSequence();
+      clearYoutubePadPlayback(true);
       voiceSourcesRef.current.forEach(voices => voices.forEach(source => { try { source.stop(); } catch { /* already stopped */ } }));
       voiceSourcesRef.current.clear();
       sourceRefs.current.forEach(source => { try { source.stop(); } catch { /* already stopped */ } });
@@ -933,6 +1079,13 @@ function App() {
       setActivePads(new Set());
       setPads(loadedPads);
       padsRef.current = loadedPads;
+      const firstYoutubeCue = loadedPads.find(pad => pad.youtubeCue)?.youtubeCue;
+      if (firstYoutubeCue) {
+        setYoutubeUrl(firstYoutubeCue.url);
+        setYoutubeStart(firstYoutubeCue.start);
+        setYoutubeEnd(firstYoutubeCue.end);
+        if (!youtubePlayerRef.current || !youtubeReady) setYoutubeId(firstYoutubeCue.videoId);
+      }
       setPatterns(record.patterns);
       patternsRef.current = record.patterns;
       setCurrentPattern(0);
@@ -1092,7 +1245,7 @@ function App() {
       const audio = context();
       if (audio.state !== 'running') await audio.resume();
       const buffer = await audio.decodeAudioData(await file.arrayBuffer());
-      const updated: Pad = { ...padsRef.current[index], name: file.name, duration: buffer.duration, buffer, bars: makeWave(buffer) };
+      const updated: Pad = { ...padsRef.current[index], name: file.name, duration: buffer.duration, buffer, bars: makeWave(buffer), youtubeCue: undefined };
       setPads(old => old.map((pad, slot) => slot === index ? updated : pad));
       setSelected(index);
       try { await persistSample(index, file); setNotice('Sample loaded · saved on this device'); }
@@ -1196,15 +1349,33 @@ function App() {
     const id = parseYouTubeId(youtubeUrl);
     if (!id) {
       setYoutubeMessage('Paste a valid YouTube watch, short, or embed link.');
+      if (youtubeLoopTimerRef.current !== null) window.clearInterval(youtubeLoopTimerRef.current);
+      youtubeLoopTimerRef.current = null;
+      clearYoutubePadPlayback(true);
       setYoutubeId('');
+      setYoutubeReady(false);
       setYoutubeLoop(false);
+      youtubePendingPadCueRef.current = null;
       return;
     }
-    if (id === youtubeId && youtubePlayerRef.current) {
-      youtubePlayerRef.current.seekTo(0, true);
-      youtubePlayerRef.current.pauseVideo();
+    youtubePendingPadCueRef.current = null;
+    const player = youtubePlayerRef.current;
+    if (youtubeReady && player) {
+      const sameVideo = id === youtubeActiveVideoIdRef.current;
+      if (youtubeLoopTimerRef.current !== null) window.clearInterval(youtubeLoopTimerRef.current);
+      youtubeLoopTimerRef.current = null;
       setYoutubeLoop(false);
-      setYoutubeMessage('Preview ready · set start and end cues below');
+      clearYoutubePadPlayback(true);
+      setYoutubeStart(0);
+      setYoutubeEnd(5);
+      youtubeActiveVideoIdRef.current = id;
+      if (sameVideo) {
+        player.seekTo(0, true);
+        player.pauseVideo();
+      } else {
+        player.loadVideoById({ videoId: id, startSeconds: 0 });
+      }
+      setYoutubeMessage('Preview loaded · set in and out points, then assign the cue to a pad');
       return;
     }
     setYoutubeMessage('Loading YouTube preview…');
@@ -1212,12 +1383,57 @@ function App() {
     setYoutubeEnd(5);
     setYoutubeLoop(false);
     setYoutubeReady(false);
-    setYoutubeId(id);
+    if (youtubeId === id) setYoutubePlayerVersion(value => value + 1);
+    else setYoutubeId(id);
+  };
+
+  const assignYoutubeCueToPad = () => {
+    const player = youtubePlayerRef.current;
+    const playerVideoId = player ? parseYouTubeId(player.getVideoUrl()) : null;
+    if (playerVideoId) youtubeActiveVideoIdRef.current = playerVideoId;
+    const videoId = playerVideoId ?? youtubeActiveVideoIdRef.current;
+    if (!youtubeReady || !videoId) {
+      setYoutubeMessage('Preview a YouTube link first, then assign its cue.');
+      return;
+    }
+    if (parseYouTubeId(youtubeUrl) !== videoId) {
+      setYoutubeMessage('Preview the link currently in the box before assigning its cue.');
+      return;
+    }
+    if (!(youtubeEnd > youtubeStart)) {
+      setYoutubeMessage('Set the out point after the in point.');
+      return;
+    }
+    const cue: YouTubeCue = {
+      videoId,
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      start: youtubeStart,
+      end: youtubeEnd,
+    };
+    if (youtubeActivePadRef.current === selected) clearYoutubePadPlayback(true);
+    const next = [...padsRef.current];
+    next[selected] = { ...next[selected], youtubeCue: cue };
+    padsRef.current = next;
+    setPads(next);
+    setYoutubeMessage(`YouTube cue saved on pad ${selected + 1}. Add another link and assign it to a different pad.`);
+  };
+
+  const clearYoutubeCueFromPad = (index: number) => {
+    if (youtubePendingPadCueRef.current?.index === index) youtubePendingPadCueRef.current = null;
+    if (youtubeActivePadRef.current === index) clearYoutubePadPlayback(true);
+    const next = [...padsRef.current];
+    const pad = next[index];
+    next[index] = { ...pad, youtubeCue: undefined };
+    padsRef.current = next;
+    setPads(next);
+    setYoutubeMessage(`YouTube cue removed from pad ${index + 1}.`);
   };
 
   const setYoutubeCue = (cue: 'start' | 'end') => {
     const player = youtubePlayerRef.current;
     if (!player) return;
+    const playerVideoId = parseYouTubeId(player.getVideoUrl());
+    if (playerVideoId) youtubeActiveVideoIdRef.current = playerVideoId;
     const time = Math.max(0, player.getCurrentTime());
     if (cue === 'start') {
       setYoutubeStart(Math.min(time, Math.max(0, youtubeEnd - 0.05)));
@@ -1232,6 +1448,8 @@ function App() {
     const player = youtubePlayerRef.current;
     if (!player || !youtubeReady) return;
     if (youtubeLoop) {
+      if (youtubeLoopTimerRef.current !== null) window.clearInterval(youtubeLoopTimerRef.current);
+      youtubeLoopTimerRef.current = null;
       setYoutubeLoop(false);
       player.pauseVideo();
       return;
@@ -1240,6 +1458,7 @@ function App() {
       setYoutubeMessage('Set the out point after the in point.');
       return;
     }
+    clearYoutubePadPlayback(true);
     player.seekTo(youtubeStart, true);
     player.playVideo();
     setYoutubeLoop(true);
@@ -1344,7 +1563,7 @@ function App() {
     try {
       const buffer = await captureLocalVideoAudio(start, end);
       const name = `${localVideoName.replace(/\.[^.]+$/, '')}${matchYoutubeCue ? ' reference cue' : ''} ${start.toFixed(2)}-${end.toFixed(2)}s.wav`;
-      const updated: Pad = { ...padsRef.current[selected], name, duration: buffer.duration, buffer, bars: makeWave(buffer), trimStart: 0, trimEnd: 1 };
+      const updated: Pad = { ...padsRef.current[selected], name, duration: buffer.duration, buffer, bars: makeWave(buffer), trimStart: 0, trimEnd: 1, youtubeCue: undefined };
       const next = [...padsRef.current];
       next[selected] = updated;
       padsRef.current = next;
@@ -1660,14 +1879,14 @@ function App() {
           <div className="brand-mark"><Activity size={20} strokeWidth={2.5} /></div>
           <div><div className="brand-title">PadLoop</div><div className="brand-sub">Sampler · 01</div></div>
         </div>
-        <div className="local-pill" data-testid="status-local-only"><i className="local-dot" /> SAMPLES STAY LOCAL <span>·</span> YOUTUBE PREVIEW</div>
+        <div className="local-pill" data-testid="status-local-only"><i className="local-dot" /> LOCAL SAMPLES <span>·</span> YOUTUBE CUE PADS</div>
       </header>
 
       <section className="intro">
         <div>
           <div className="eyebrow">YOUR SOUNDS, YOUR POCKET KIT</div>
           <h1>Load it. Tap it. Loop it.</h1>
-          <p>A little sampler for the sounds already on your device.</p>
+          <p>A sampler for local sounds and YouTube cue pads.</p>
         </div>
         <div className="intro-actions">
           <button className="preset-load" onClick={() => void loadBouncyPreset()} data-testid="button-load-bouncy-808">
@@ -1683,13 +1902,13 @@ function App() {
         <div className="panel">
           <div className="panel-head">
             <div className="panel-heading"><span className="section-index">01 /</span><h2>Sound board</h2></div>
-            <span className="hint" data-testid="text-pad-count">{pads.filter(pad => pad.buffer).length} / 16 loaded</span>
+            <span className="hint" data-testid="text-pad-count">{pads.filter(pad => pad.buffer || pad.youtubeCue).length} / 16 loaded</span>
           </div>
           <div className="pad-grid" data-testid="grid-sample-pads">
             {pads.map((pad, index) => (
               <button
                 key={index}
-                className={`pad ${pad.buffer ? 'loaded' : ''} ${selected === index ? 'selected' : ''} ${activePads.has(index) ? 'playing' : ''}`}
+                className={`pad ${pad.buffer || pad.youtubeCue ? 'loaded' : ''} ${selected === index ? 'selected' : ''} ${activePads.has(index) ? 'playing' : ''}`}
                 style={{ '--pad-color': padColors[index] } as CSSProperties & Record<string, string>}
                 onPointerDown={event => {
                   setSelected(index);
@@ -1701,17 +1920,17 @@ function App() {
                 onPointerLeave={() => releasePad(index)}
                 onClick={() => {
                   setSelected(index);
-                  if (pad.buffer && pad.triggerMode !== 'gate') handlePadHit(index, pointerVelocityRef.current.get(index) ?? 0.88);
+                  if ((pad.buffer || pad.youtubeCue) && pad.triggerMode !== 'gate') handlePadHit(index, pointerVelocityRef.current.get(index) ?? 0.88);
                 }}
                 onDragOver={event => { event.preventDefault(); setSelected(index); setDragging(true); }}
                 onDragLeave={() => setDragging(false)}
                 onDrop={event => { event.preventDefault(); setDragging(false); const file = event.dataTransfer.files[0]; if (file) void importFile(file, index); }}
                 data-testid={`button-pad-${index + 1}`}
-                aria-label={`Pad ${index + 1}${pad.name ? `, ${pad.name}` : ', empty'}. Keyboard ${PAD_KEYS[index]}`}
+                aria-label={`Pad ${index + 1}${pad.name ? `, ${pad.name}` : pad.youtubeCue ? `, YouTube cue ${pad.youtubeCue.videoId}` : ', empty'}. Keyboard ${PAD_KEYS[index]}`}
               >
                 <span className="pad-top"><span>{String(index + 1).padStart(2, '0')}</span><span className="pad-key">{PAD_KEYS[index]}</span></span>
-                {pad.name ? <span className="pad-name" data-testid={`text-pad-name-${index + 1}`}>{pad.name}</span> : <span className="pad-name pad-empty">Drop a sound</span>}
-                <span className="pad-meta"><span>{pad.buffer ? formatTime(pad.duration) : 'EMPTY SLOT'}</span><span>{pad.triggerMode === 'gate' ? 'GATE' : pad.loop ? 'LOOP' : pad.buffer ? 'ONE SHOT' : '·'}</span></span>
+                {pad.name ? <span className="pad-name" data-testid={`text-pad-name-${index + 1}`}>{pad.name}</span> : pad.youtubeCue ? <span className="pad-name" data-testid={`text-pad-name-${index + 1}`}>YT · {pad.youtubeCue.videoId.slice(0, 5)}</span> : <span className="pad-name pad-empty">Drop a sound</span>}
+                <span className="pad-meta"><span>{pad.buffer ? formatTime(pad.duration) : pad.youtubeCue ? formatTime(pad.youtubeCue.end - pad.youtubeCue.start) : 'EMPTY SLOT'}</span><span>{pad.youtubeCue ? 'YOUTUBE' : pad.triggerMode === 'gate' ? 'GATE' : pad.loop ? 'LOOP' : pad.buffer ? 'ONE SHOT' : '·'}</span></span>
                 {pad.buffer && <span className="wave" aria-label={`Waveform for ${pad.name}`} data-testid={`waveform-pad-${index + 1}`}>{pad.bars.map((height, bar) => <i key={bar} style={{ '--bar-height': `${height}%` } as CSSProperties & Record<string, string>} />)}</span>}
               </button>
             ))}
@@ -1723,7 +1942,7 @@ function App() {
           <div className="panel selected-panel">
             <div className="selected-head">
               <div className="selected-title"><span className="pad-number">PAD {String(selected + 1).padStart(2, '0')}</span><h2>Sample deck</h2></div>
-              {current.buffer && <button className="icon-button" aria-label="Remove sample" title="Remove sample" onClick={() => removePad(selected)} data-testid="button-remove-sample"><X size={15} /></button>}
+              {(current.buffer || current.youtubeCue) && <button className="icon-button" aria-label="Clear pad" title="Clear pad" onClick={() => removePad(selected)} data-testid="button-remove-sample"><X size={15} /></button>}
             </div>
             <div
               className={`sample-drop ${dragging ? 'dragging' : ''}`}
@@ -1742,6 +1961,25 @@ function App() {
                 <><div className="drop-icon"><Upload size={18} /></div><div className="drop-copy"><strong>Drop a sample here</strong><span>or click to browse · WAV, MP3, M4A, OGG, FLAC, AIFF</span></div><Plus size={16} color="#88918d" /></>
               )}
             </div>
+            {current.youtubeCue && <div className="assigned-youtube-cue" data-testid="panel-assigned-youtube-cue">
+              <div className="assigned-youtube-copy">
+                <strong>YouTube cue · {current.youtubeCue.start.toFixed(2)}–{current.youtubeCue.end.toFixed(2)}s</strong>
+                <span>{current.buffer ? 'This YouTube cue plays on pad hits; the attached local sample returns when you remove the cue.' : 'Pad presses play this range in the visible YouTube player. It is not an offline WAV.'}</span>
+                <a href={current.youtubeCue.url} target="_blank" rel="noreferrer">Open source video</a>
+              </div>
+              <div className="assigned-youtube-actions">
+                <button
+                  className="small-action"
+                  onPointerDown={event => { event.stopPropagation(); if (current.triggerMode === 'gate') void playPad(selected); }}
+                  onPointerUp={event => { event.stopPropagation(); releasePad(selected); }}
+                  onPointerLeave={() => releasePad(selected)}
+                  onClick={event => { event.stopPropagation(); if (current.triggerMode !== 'gate') void playPad(selected); }}
+                  data-testid="button-play-youtube-cue"
+                ><Play size={12} /> Play cue</button>
+                {activePads.has(selected) && <button className="small-action" onClick={() => stopPad(selected)} data-testid="button-stop-youtube-cue"><Pause size={12} /> Stop</button>}
+                <button className="small-action" onClick={() => clearYoutubeCueFromPad(selected)} data-testid="button-clear-youtube-cue">Remove cue</button>
+              </div>
+            </div>}
             {current.buffer && <div className="sample-actions" style={{ marginTop: 10 }}>
               <button className="small-action" onClick={() => chooseFile(selected)} data-testid="button-replace-sample"><Upload size={12} /> Replace</button>
               <button className="small-action" onClick={() => exportPad(selected)} data-testid="button-export-selected-pad"><Download size={12} /> Download WAV</button>
@@ -1830,6 +2068,19 @@ function App() {
                 />
                 <button className="small-action" onClick={loadYoutubePreview} data-testid="button-load-youtube">Preview</button>
               </div>
+              {pads.some(pad => pad.youtubeCue) && <div className="youtube-saved-cues" data-testid="list-youtube-pad-cues">
+                <span>SAVED CUES</span>
+                {pads.map((pad, index) => pad.youtubeCue && <button
+                  className="small-action"
+                  key={index}
+                  onPointerDown={() => { if (pad.triggerMode === 'gate') handlePadHit(index); }}
+                  onPointerUp={() => releasePad(index)}
+                  onPointerLeave={() => releasePad(index)}
+                  onClick={() => { if (pad.triggerMode !== 'gate') handlePadHit(index); }}
+                  title={`Play YouTube cue on pad ${index + 1}`}
+                  data-testid={`button-youtube-saved-pad-${index + 1}`}
+                >Pad {String(index + 1).padStart(2, '0')} · {pad.youtubeCue.videoId.slice(0, 5)}</button>)}
+              </div>}
               {youtubeId && <div className="youtube-player-frame"><div className="youtube-player-host" ref={youtubePlayerHostRef} /></div>}
               {youtubeId && <div className="cue-controls">
                 <label>In <input type="number" min="0" step=".05" value={youtubeStart} onChange={event => setYoutubeStart(Math.max(0, Number(event.target.value) || 0))} data-testid="input-youtube-in" /></label>
@@ -1841,16 +2092,27 @@ function App() {
               {youtubeId && <div className="youtube-pad-action">
                 <button
                   className="small-action"
+                  onClick={assignYoutubeCueToPad}
+                  disabled={!youtubeReady || youtubeEnd <= youtubeStart || parseYouTubeId(youtubeUrl) !== youtubeActiveVideoIdRef.current}
+                  data-testid="button-assign-youtube-cue"
+                >
+                  Add cue to pad {selected + 1}
+                </button>
+                <span>Each pad keeps its own link and cue. Choose another pad and repeat to add more links.</span>
+              </div>}
+              {youtubeId && <div className="youtube-pad-action">
+                <button
+                  className="small-action"
                   onClick={() => void captureVideoClipToPad(youtubeStart, youtubeEnd, true)}
                   disabled={!youtubeReady || !localVideoUrl || localVideoDuration < youtubeEnd || videoBusy}
                   data-testid="button-youtube-cue-to-pad"
                 >
-                  {videoBusy ? 'Capturing…' : `Add local cue to pad ${selected + 1}`}
+                  {videoBusy ? 'Capturing…' : `Use matching local video on pad ${selected + 1}`}
                 </button>
                 <span>{!localVideoUrl ? 'Choose a matching local video below to enable.' : localVideoDuration < youtubeEnd ? 'The local video must be at least as long as the cue.' : 'Uses the matching time range from your local video, not YouTube audio.'}</span>
               </div>}
               {youtubeMessage && <p className="video-message" role="status">{youtubeMessage}</p>}
-              <p className="video-legal-note">YouTube links play in YouTube’s embedded player; this app can’t extract or export their audio. Load a matching local video file you have rights to sample below to put its cue range on a pad.</p>
+              <p className="video-legal-note">Assigned pads play through the visible YouTube player. YouTube audio is streamed, not copied to a local WAV or included in exports.</p>
 
               <div className="video-divider" />
               <div className="video-subhead">Chop a local video into pads</div>
@@ -1989,7 +2251,7 @@ function App() {
         </div>
         <div className="panel guide-panel">
           <div className="bottom-title"><span className="section-index">i /</span><h2>Made for the session</h2></div>
-          <p className="guide-copy"><strong>Your files stay yours.</strong> Samples and local video clips are processed and saved on this device where browser storage allows. YouTube previews load from YouTube; their audio cannot be extracted here. Export WAV or MIDI for FL Studio and Waveform.</p>
+          <p className="guide-copy"><strong>Your files stay yours.</strong> Local samples and cue links are saved on this device where browser storage allows. YouTube cues play inside the visible YouTube player and are not copied into WAV or MIDI exports. Export local sounds for FL Studio and Waveform.</p>
           <div className="volume-control" style={{ marginTop: 11 }}><Volume2 size={14} color="#969d9e" /><label htmlFor="master-volume">MASTER</label><input id="master-volume" type="range" min="0" max="1" step=".01" value={master} onChange={event => setMaster(Number(event.target.value))} data-testid="input-master-volume" /><span className="hint">{Math.round(master * 100)}%</span></div>
         </div>
       </section>
