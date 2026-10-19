@@ -513,7 +513,7 @@ function App() {
   const delayTimeRef = useRef<DelayNode | null>(null);
   const reverseBuffersRef = useRef<WeakMap<AudioBuffer, AudioBuffer>>(new WeakMap());
   const scheduledTimersRef = useRef<Set<number>>(new Set());
-  const pointerVelocityRef = useRef<Map<number, number>>(new Map());
+  const lastPadPointerAtRef = useRef<Map<number, number>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
   const localVideoInputRef = useRef<HTMLInputElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -1345,6 +1345,26 @@ function App() {
     void playPad(index, velocity);
   };
 
+  const handlePadPointerDown = (index: number, pointerType: string, pressure: number) => {
+    lastPadPointerAtRef.current.set(index, performance.now());
+    const pad = padsRef.current[index];
+    if (pad?.buffer || pad?.youtubeCue) {
+      const velocity = pointerType === 'pen' && pressure > 0 ? pressure : 0.88;
+      handlePadHit(index, velocity);
+    } else {
+      setSelected(index);
+    }
+  };
+
+  const handlePadClickFallback = (index: number, clickDetail: number) => {
+    setSelected(index);
+    if (clickDetail !== 0) return;
+    const lastPointerAt = lastPadPointerAtRef.current.get(index);
+    if (lastPointerAt !== undefined && performance.now() - lastPointerAt < 800) return;
+    const pad = padsRef.current[index];
+    if ((pad?.buffer || pad?.youtubeCue) && pad.triggerMode !== 'gate') handlePadHit(index);
+  };
+
   const loadYoutubePreview = () => {
     const id = parseYouTubeId(youtubeUrl);
     if (!id) {
@@ -1911,17 +1931,11 @@ function App() {
                 className={`pad ${pad.buffer || pad.youtubeCue ? 'loaded' : ''} ${selected === index ? 'selected' : ''} ${activePads.has(index) ? 'playing' : ''}`}
                 style={{ '--pad-color': padColors[index] } as CSSProperties & Record<string, string>}
                 onPointerDown={event => {
-                  setSelected(index);
-                  const velocity = event.pointerType === 'pen' && event.pressure > 0 ? event.pressure : 0.88;
-                  pointerVelocityRef.current.set(index, velocity);
-                  if (pad.triggerMode === 'gate') handlePadHit(index, velocity);
+                  handlePadPointerDown(index, event.pointerType, event.pressure);
                 }}
                 onPointerUp={() => releasePad(index)}
                 onPointerLeave={() => releasePad(index)}
-                onClick={() => {
-                  setSelected(index);
-                  if ((pad.buffer || pad.youtubeCue) && pad.triggerMode !== 'gate') handlePadHit(index, pointerVelocityRef.current.get(index) ?? 0.88);
-                }}
+                onClick={event => handlePadClickFallback(index, event.detail)}
                 onDragOver={event => { event.preventDefault(); setSelected(index); setDragging(true); }}
                 onDragLeave={() => setDragging(false)}
                 onDrop={event => { event.preventDefault(); setDragging(false); const file = event.dataTransfer.files[0]; if (file) void importFile(file, index); }}
@@ -1956,7 +1970,7 @@ function App() {
               data-testid="dropzone-sample"
             >
               {current.buffer ? (
-                <><div className="drop-icon"><AudioLines size={19} /></div><div className="sample-detail"><div className="sample-filename" data-testid="text-selected-sample">{current.name}</div><div className="sample-length" data-testid="text-sample-duration">{formatTime(current.duration)} · {current.buffer.numberOfChannels === 1 ? 'MONO' : 'STEREO'} · {Math.round(current.buffer.sampleRate / 1000)} kHz</div></div><button className="small-action" onPointerDown={event => { event.stopPropagation(); if (current.triggerMode === 'gate') void playPad(selected); }} onPointerUp={event => { event.stopPropagation(); releasePad(selected); }} onPointerLeave={() => releasePad(selected)} onClick={event => { event.stopPropagation(); if (current.triggerMode !== 'gate') void playPad(selected); }} data-testid="button-preview-sample"><Play size={13} /> Preview</button>{activePads.has(selected) && <button className="small-action" onClick={event => { event.stopPropagation(); stopPad(selected); }} data-testid="button-stop-sample"><Pause size={13} /> Stop</button>}</>
+                <><div className="drop-icon"><AudioLines size={19} /></div><div className="sample-detail"><div className="sample-filename" data-testid="text-selected-sample">{current.name}</div><div className="sample-length" data-testid="text-sample-duration">{formatTime(current.duration)} · {current.buffer.numberOfChannels === 1 ? 'MONO' : 'STEREO'} · {Math.round(current.buffer.sampleRate / 1000)} kHz</div></div><button className="small-action" onPointerDown={event => { event.stopPropagation(); handlePadPointerDown(selected, event.pointerType, event.pressure); }} onPointerUp={event => { event.stopPropagation(); releasePad(selected); }} onPointerLeave={() => releasePad(selected)} onClick={event => { event.stopPropagation(); handlePadClickFallback(selected, event.detail); }} data-testid="button-preview-sample"><Play size={13} /> Preview</button>{activePads.has(selected) && <button className="small-action" onClick={event => { event.stopPropagation(); stopPad(selected); }} data-testid="button-stop-sample"><Pause size={13} /> Stop</button>}</>
               ) : (
                 <><div className="drop-icon"><Upload size={18} /></div><div className="drop-copy"><strong>Drop a sample here</strong><span>or click to browse · WAV, MP3, M4A, OGG, FLAC, AIFF</span></div><Plus size={16} color="#88918d" /></>
               )}
@@ -1970,10 +1984,10 @@ function App() {
               <div className="assigned-youtube-actions">
                 <button
                   className="small-action"
-                  onPointerDown={event => { event.stopPropagation(); if (current.triggerMode === 'gate') void playPad(selected); }}
+                  onPointerDown={event => { event.stopPropagation(); handlePadPointerDown(selected, event.pointerType, event.pressure); }}
                   onPointerUp={event => { event.stopPropagation(); releasePad(selected); }}
                   onPointerLeave={() => releasePad(selected)}
-                  onClick={event => { event.stopPropagation(); if (current.triggerMode !== 'gate') void playPad(selected); }}
+                  onClick={event => { event.stopPropagation(); handlePadClickFallback(selected, event.detail); }}
                   data-testid="button-play-youtube-cue"
                 ><Play size={12} /> Play cue</button>
                 {activePads.has(selected) && <button className="small-action" onClick={() => stopPad(selected)} data-testid="button-stop-youtube-cue"><Pause size={12} /> Stop</button>}
@@ -2073,10 +2087,10 @@ function App() {
                 {pads.map((pad, index) => pad.youtubeCue && <button
                   className="small-action"
                   key={index}
-                  onPointerDown={() => { if (pad.triggerMode === 'gate') handlePadHit(index); }}
+                  onPointerDown={event => handlePadPointerDown(index, event.pointerType, event.pressure)}
                   onPointerUp={() => releasePad(index)}
                   onPointerLeave={() => releasePad(index)}
-                  onClick={() => { if (pad.triggerMode !== 'gate') handlePadHit(index); }}
+                  onClick={event => handlePadClickFallback(index, event.detail)}
                   title={`Play YouTube cue on pad ${index + 1}`}
                   data-testid={`button-youtube-saved-pad-${index + 1}`}
                 >Pad {String(index + 1).padStart(2, '0')} · {pad.youtubeCue.videoId.slice(0, 5)}</button>)}
