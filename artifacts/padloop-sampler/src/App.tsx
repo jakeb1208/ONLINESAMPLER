@@ -6,9 +6,12 @@ import { detectBpm, makeImpulse, renderSample, reverseBuffer, sliceBuffer, stret
 type YouTubePlayer = {
   getCurrentTime: () => number;
   getDuration: () => number;
+  getPlayerState: () => number;
   seekTo: (seconds: number, allowSeekAhead?: boolean) => void;
   playVideo: () => void;
   pauseVideo: () => void;
+  setVolume: (volume: number) => void;
+  loadVideoById: (options: { videoId: string; startSeconds?: number; endSeconds?: number }) => void;
   destroy: () => void;
 };
 
@@ -25,7 +28,7 @@ type YouTubeApi = {
       };
     },
   ) => YouTubePlayer;
-  PlayerState: { PLAYING: number };
+  PlayerState: { PLAYING: number; ENDED: number };
 };
 
 declare global {
@@ -72,11 +75,48 @@ function parseYouTubeId(value: string) {
   }
 }
 
+type YouTubeCue = {
+  videoId: string;
+  url: string;
+  start: number;
+  end: number;
+};
+
+const YOUTUBE_CUES_STORAGE_KEY = 'padloop-youtube-pad-cues-v1';
+
+function readYoutubePadCues(): Array<YouTubeCue | null> {
+  const empty = Array.from({ length: 16 }, () => null as YouTubeCue | null);
+  try {
+    const stored = JSON.parse(localStorage.getItem(YOUTUBE_CUES_STORAGE_KEY) ?? 'null') as unknown;
+    if (!Array.isArray(stored)) return empty;
+    return empty.map((_, index) => {
+      const item = stored[index];
+      if (!item || typeof item !== 'object') return null;
+      const cue = item as Partial<YouTubeCue>;
+      if (
+        typeof cue.videoId !== 'string'
+        || typeof cue.url !== 'string'
+        || parseYouTubeId(cue.url) !== cue.videoId
+        || typeof cue.start !== 'number'
+        || typeof cue.end !== 'number'
+        || !Number.isFinite(cue.start)
+        || !Number.isFinite(cue.end)
+        || cue.start < 0
+        || cue.end <= cue.start
+      ) return null;
+      return { videoId: cue.videoId, url: cue.url, start: cue.start, end: cue.end };
+    });
+  } catch {
+    return empty;
+  }
+}
+
 type Pad = {
   name: string;
   duration: number;
   buffer: AudioBuffer | null;
   bars: number[];
+  youtubeCue?: YouTubeCue;
   loop: boolean;
   volume: number;
   triggerMode: 'one-shot' | 'gate';
